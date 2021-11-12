@@ -1,0 +1,1825 @@
+From 6392fdc1f7a7a90c8cba95d463a7c0fb8ec3e177 Mon Sep 17 00:00:00 2001
+From: pankajd <pankajd@xilinx.com>
+Date: Thu, 5 Aug 2021 01:34:06 -0600
+Subject: [PATCH] gst-plugins-base: Add HDR10 support
+
+Ported from https://github.com/Xilinx/gst-plugins-base/commits/xlnx-rebase-v1.16.3
+
+Signed-off-by: pankajd <pankajd@xilinx.com>
+---
+ docs/libs/gst-plugins-base-libs-sections.txt |  17 +
+ gst-libs/gst/video/Makefile.am               |   4 +-
+ gst-libs/gst/video/gstvideodecoder.c         |  35 ++
+ gst-libs/gst/video/gstvideoencoder.c         |  29 +
+ gst-libs/gst/video/meson.build               |   2 +
+ gst-libs/gst/video/video-color.c             | 327 ++++++++++++
+ gst-libs/gst/video/video-color.h             |  40 +-
+ gst-libs/gst/video/video-hdr.c               | 757 +++++++++++++++++++++++++++
+ gst-libs/gst/video/video-hdr.h               | 404 ++++++++++++++
+ gst-libs/gst/video/video.h                   |   1 +
+ 10 files changed, 1614 insertions(+), 2 deletions(-)
+ create mode 100644 gst-libs/gst/video/video-hdr.c
+ create mode 100644 gst-libs/gst/video/video-hdr.h
+
+diff --git a/docs/libs/gst-plugins-base-libs-sections.txt b/docs/libs/gst-plugins-base-libs-sections.txt
+index 82040a4..0e96aaf 100644
+--- a/docs/libs/gst-plugins-base-libs-sections.txt
++++ b/docs/libs/gst-plugins-base-libs-sections.txt
+@@ -3047,6 +3047,23 @@ GST_TYPE_VIDEO_MATRIX_MODE
+ GST_TYPE_VIDEO_PRIMARIES_MODE
+ GST_TYPE_VIDEO_DITHER_METHOD
+ 
++#video-hdr.h
++<SUBSECTION>
++GstVideoMasteringDisplayInfo
++GstVideoContentLightLevel
++gst_video_mastering_display_info_add_to_caps
++gst_video_mastering_display_info_from_caps
++gst_video_mastering_display_info_from_string
++gst_video_mastering_display_info_init
++gst_video_mastering_display_info_is_equal
++gst_video_mastering_display_info_is_valid
++gst_video_mastering_display_info_to_string
++gst_video_content_light_level_add_to_caps
++gst_video_content_light_level_from_caps
++gst_video_content_light_level_from_string
++gst_video_content_light_level_init
++gst_video_content_light_level_to_string
++
+ #video-multiview.h
+ <SUBSECTION>
+ GstVideoMultiviewMode
+diff --git a/gst-libs/gst/video/Makefile.am b/gst-libs/gst/video/Makefile.am
+index b101f00..be99db8 100644
+--- a/gst-libs/gst/video/Makefile.am
++++ b/gst-libs/gst/video/Makefile.am
+@@ -5,7 +5,7 @@ include $(top_srcdir)/common/orc.mak
+ glib_enum_headers = video.h video-format.h video-color.h video-info.h video-dither.h \
+ 			colorbalance.h navigation.h video-chroma.h video-tile.h video-converter.h \
+ 			video-resampler.h video-frame.h video-scaler.h video-anc.h \
+-			video-overlay-composition.h
++			video-overlay-composition.h video-hdr.h
+ glib_enum_define = GST_VIDEO
+ glib_gen_prefix = gst_video
+ glib_gen_basename = video
+@@ -34,6 +34,7 @@ libgstvideo_@GST_API_VERSION@_la_SOURCES = \
+ 	video-dither.c    	\
+ 	video-info.c         	\
+ 	video-frame.c         	\
++	video-hdr.c             \
+ 	video-scaler.c          \
+ 	video-tile.c         	\
+ 	gstvideoaggregator.c	\
+@@ -74,6 +75,7 @@ libgstvideo_@GST_API_VERSION@include_HEADERS = \
+ 	video-dither.h      	\
+ 	video-info.h         	\
+ 	video-frame.h         	\
++	video-hdr.h             \
+ 	video-scaler.h          \
+ 	video-tile.h         	\
+ 	gstvideoaggregator.h	\
+diff --git a/gst-libs/gst/video/gstvideodecoder.c b/gst-libs/gst/video/gstvideodecoder.c
+index b49c4d1..326768e 100644
+--- a/gst-libs/gst/video/gstvideodecoder.c
++++ b/gst-libs/gst/video/gstvideodecoder.c
+@@ -3792,6 +3792,7 @@ gst_video_decoder_negotiate_default (GstVideoDecoder * decoder)
+   gboolean ret = TRUE;
+   GstVideoCodecFrame *frame;
+   GstCaps *prevcaps;
++  GstCaps *incaps;
+ 
+   if (!state) {
+     GST_DEBUG_OBJECT (decoder,
+@@ -3819,6 +3820,40 @@ gst_video_decoder_negotiate_default (GstVideoDecoder * decoder)
+ 
+   if (state->caps == NULL)
+     state->caps = gst_video_info_to_caps (&state->info);
++
++  incaps = gst_pad_get_current_caps (GST_VIDEO_DECODER_SINK_PAD (decoder));
++  if (incaps) {
++    GstStructure *in_struct;
++
++    in_struct = gst_caps_get_structure (incaps, 0);
++    if (gst_structure_has_field (in_struct, "mastering-display-info") ||
++        gst_structure_has_field (in_struct, "content-light-level")) {
++      const gchar *s;
++
++      /* prefer upstream information */
++      state->caps = gst_caps_make_writable (state->caps);
++      if ((s = gst_structure_get_string (in_struct, "mastering-display-info"))) {
++        gst_caps_set_simple (state->caps,
++            "mastering-display-info", G_TYPE_STRING, s, NULL);
++      }
++
++      if ((s = gst_structure_get_string (in_struct, "content-light-level"))) {
++        gst_caps_set_simple (state->caps,
++            "content-light-level", G_TYPE_STRING, s, NULL);
++      }
++    }
++    if (gst_structure_has_field (in_struct, "hdr-format")) {
++      const gchar *s;
++      state->caps = gst_caps_make_writable (state->caps);
++
++      if ((s = gst_structure_get_string (in_struct, "hdr-format"))) {
++        gst_caps_set_simple (state->caps, "hdr-format", G_TYPE_STRING, s, NULL);
++      }
++    }
++
++    gst_caps_unref (incaps);
++  }
++
+   if (state->allocation_caps == NULL)
+     state->allocation_caps = gst_caps_ref (state->caps);
+ 
+diff --git a/gst-libs/gst/video/gstvideoencoder.c b/gst-libs/gst/video/gstvideoencoder.c
+index 3205d26..212f1db 100644
+--- a/gst-libs/gst/video/gstvideoencoder.c
++++ b/gst-libs/gst/video/gstvideoencoder.c
+@@ -1677,6 +1677,8 @@ gst_video_encoder_negotiate_default (GstVideoEncoder * encoder)
+   g_return_val_if_fail (state->caps != NULL, FALSE);
+ 
+   if (encoder->priv->output_state_changed) {
++    GstCaps *incaps;
++
+     state->caps = gst_caps_make_writable (state->caps);
+ 
+     /* Fill caps */
+@@ -1724,6 +1726,33 @@ gst_video_encoder_negotiate_default (GstVideoEncoder * encoder)
+           caps_mview_mode, "multiview-flags", GST_TYPE_VIDEO_MULTIVIEW_FLAGSET,
+           GST_VIDEO_INFO_MULTIVIEW_FLAGS (info), GST_FLAG_SET_MASK_EXACT, NULL);
+     }
++
++    incaps = gst_pad_get_current_caps (GST_VIDEO_ENCODER_SINK_PAD (encoder));
++    if (incaps) {
++      GstStructure *in_struct;
++      GstStructure *out_struct;
++      const gchar *s;
++
++      in_struct = gst_caps_get_structure (incaps, 0);
++      out_struct = gst_caps_get_structure (state->caps, 0);
++
++      /* forward upstream mastering display info and content light level
++       * if subclass didn't set */
++      if ((s = gst_structure_get_string (in_struct, "mastering-display-info"))
++          && !gst_structure_has_field (out_struct, "mastering-display-info")) {
++        gst_caps_set_simple (state->caps, "mastering-display-info",
++            G_TYPE_STRING, s, NULL);
++      }
++
++      if ((s = gst_structure_get_string (in_struct, "content-light-level")) &&
++          !gst_structure_has_field (out_struct, "content-light-level")) {
++        gst_caps_set_simple (state->caps,
++            "content-light-level", G_TYPE_STRING, s, NULL);
++      }
++
++      gst_caps_unref (incaps);
++    }
++
+     encoder->priv->output_state_changed = FALSE;
+   }
+ 
+diff --git a/gst-libs/gst/video/meson.build b/gst-libs/gst/video/meson.build
+index b4dfcdf..c5b5d4d 100644
+--- a/gst-libs/gst/video/meson.build
++++ b/gst-libs/gst/video/meson.build
+@@ -24,6 +24,7 @@ video_sources = [
+   'video-event.c',
+   'video-format.c',
+   'video-frame.c',
++  'video-hdr.c',
+   'video-info.c',
+   'video-multiview.c',
+   'video-resampler.c',
+@@ -59,6 +60,7 @@ video_headers = [
+   'video-dither.h',
+   'video-info.h',
+   'video-frame.h',
++  'video-hdr.h',
+   'video-prelude.h',
+   'video-scaler.h',
+   'video-tile.h',
+diff --git a/gst-libs/gst/video/video-color.c b/gst-libs/gst/video/video-color.c
+index c61588a..9c0953e 100644
+--- a/gst-libs/gst/video/video-color.c
++++ b/gst-libs/gst/video/video-color.c
+@@ -69,6 +69,9 @@ static const ColorimetryInfo colorimetry[] = {
+   MAKE_COLORIMETRY (SMPTE240M, _16_235, SMPTE240M, SMPTE240M, SMPTE240M),
+   MAKE_COLORIMETRY (SRGB, _0_255, RGB, SRGB, BT709),
+   MAKE_COLORIMETRY (BT2020, _16_235, BT2020, BT2020_12, BT2020),
++  MAKE_COLORIMETRY (BT2020_10, _16_235, BT2020, BT2020_10, BT2020),
++  MAKE_COLORIMETRY (BT2100_PQ, _16_235, BT2020, SMPTE2084, BT2020),
++  MAKE_COLORIMETRY (BT2100_HLG, _16_235, BT2020, ARIB_STD_B67, BT2020),
+   MAKE_COLORIMETRY (NONAME, _0_255, BT601, UNKNOWN, UNKNOWN),
+   MAKE_COLORIMETRY (NONAME, _UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN),       /* Keep last! */
+ };
+@@ -432,6 +435,7 @@ gst_video_color_transfer_encode (GstVideoTransferFunction func, gdouble val)
+       res = pow (val, 1.0 / 2.2);
+       break;
+     case GST_VIDEO_TRANSFER_BT709:
++    case GST_VIDEO_TRANSFER_BT2020_10:
+       if (val < 0.018)
+         res = 4.5 * val;
+       else
+@@ -473,6 +477,34 @@ gst_video_color_transfer_encode (GstVideoTransferFunction func, gdouble val)
+     case GST_VIDEO_TRANSFER_ADOBERGB:
+       res = pow (val, 1.0 / 2.19921875);
+       break;
++    case GST_VIDEO_TRANSFER_SMPTE2084:
++    {
++      gdouble c1 = 3424.0 / 4096.0;     /* c3 - c2 + 1 */
++      gdouble c2 = 32 * 2413 / 4096.0;
++      gdouble c3 = 32 * 2392 / 4096.0;
++      gdouble m = 128 * 2523 / 4096.0;
++      gdouble n = 0.25 * 2610 / 4096.0;
++      gdouble Ln = pow (val, n);
++
++      /* val equal to 1 for peak white is ordinarily intended to
++       * correspond to a reference output luminance level of 10000 cd/m^2  */
++      res = pow ((c1 + c2 * Ln) / (1.0 + c3 * Ln), m);
++      break;
++    }
++    case GST_VIDEO_TRANSFER_ARIB_STD_B67:
++    {
++      gdouble a = 0.17883277;
++      gdouble b = 0.28466892;
++      gdouble c = 0.55991073;
++
++      /* For [0, 1] normalized source as defined by HEVC specification */
++      if (val > (1.0 / 12.0))
++        res = a * log (12.0 * val - b) + c;
++      else
++        res = sqrt (3.0 * val);
++
++      break;
++    }
+   }
+   return res;
+ }
+@@ -520,6 +552,7 @@ gst_video_color_transfer_decode (GstVideoTransferFunction func, gdouble val)
+       res = pow (val, 2.2);
+       break;
+     case GST_VIDEO_TRANSFER_BT709:
++    case GST_VIDEO_TRANSFER_BT2020_10:
+       if (val < 0.081)
+         res = val / 4.5;
+       else
+@@ -561,6 +594,300 @@ gst_video_color_transfer_decode (GstVideoTransferFunction func, gdouble val)
+     case GST_VIDEO_TRANSFER_ADOBERGB:
+       res = pow (val, 2.19921875);
+       break;
++    case GST_VIDEO_TRANSFER_SMPTE2084:
++    {
++      gdouble c1 = 3424.0 / 4096.0;     /* c3 - c2 + 1 */
++      gdouble c2 = 32 * 2413 / 4096.0;
++      gdouble c3 = 32 * 2392 / 4096.0;
++      gdouble mi = 1 / (128 * 2523 / 4096.0);
++      gdouble ni = 1 / (0.25 * 2610 / 4096.0);
++      gdouble nm = pow (val, mi);
++
++      res = pow ((nm - c1) / (c2 - c3 * nm), ni);
++      break;
++    }
++    case GST_VIDEO_TRANSFER_ARIB_STD_B67:
++    {
++      gdouble a = 0.17883277;
++      gdouble b = 0.28466892;
++      gdouble c = 0.55991073;
++
++      if (val > 0.5)
++        res = (exp ((val - c) / a) + b) / 12.0;
++      else
++        res = val * val / 3.0;
++
++      break;
++    }
+   }
+   return res;
+ }
++
++/* conversion between GStreamer color{matrix,transfer,primaries} enum
++ * and indices defined by ITU-T H.273 and ISO/IEC 230001-8 specification */
++
++/* FIXME 2.0: Define color{matrix,transfer,primaries} with explicit numbering
++ * to be matched with specification
++ */
++
++/**
++ * gst_video_color_matrix_to_iso:
++ * @matrix: a #GstVideoColorMatrix
++ *
++ * Converts #GstVideoColorMatrix to the "matrix coefficients"
++ * (MatrixCoefficients) value defined by "ISO/IEC 23001-8 Section 7.3 Table 4"
++ * and "ITU-T H.273 Table 4".
++ * "H.264 Table E-5" and "H.265 Table E.5" share the identical values.
++ *
++ * Returns: The value of ISO/IEC 23001-8 matrix coefficients.
++ *
++ * Since: 1.18
++ */
++guint
++gst_video_color_matrix_to_iso (GstVideoColorMatrix matrix)
++{
++  switch (matrix) {
++    case GST_VIDEO_COLOR_MATRIX_RGB:
++      return 0;
++    case GST_VIDEO_COLOR_MATRIX_BT709:
++      return 1;
++    case GST_VIDEO_COLOR_MATRIX_FCC:
++      return 4;
++    case GST_VIDEO_COLOR_MATRIX_BT601:
++      return 6;
++    case GST_VIDEO_COLOR_MATRIX_SMPTE240M:
++      return 7;
++    case GST_VIDEO_COLOR_MATRIX_BT2020:
++      return 9;
++    case GST_VIDEO_COLOR_MATRIX_UNKNOWN:
++    default:
++      return 2;
++  }
++}
++
++/**
++ * gst_video_color_transfer_to_iso:
++ * @func: a #GstVideoTransferFunction
++ *
++ * Converts #GstVideoTransferFunction to the "transfer characteristics"
++ * (TransferCharacteristics) value defined by "ISO/IEC 23001-8 Section 7.2 Table 3"
++ * and "ITU-T H.273 Table 3".
++ * "H.264 Table E-4" and "H.265 Table E.4" share the identical values.
++ *
++ * Returns: The value of ISO/IEC 23001-8 transfer characteristics.
++ *
++ * Since: 1.18
++ */
++guint
++gst_video_color_transfer_to_iso (GstVideoTransferFunction func)
++{
++  switch (func) {
++    case GST_VIDEO_TRANSFER_BT709:
++      return 1;
++    case GST_VIDEO_TRANSFER_GAMMA22:
++      return 4;
++    case GST_VIDEO_TRANSFER_GAMMA28:
++      return 5;
++    case GST_VIDEO_TRANSFER_SMPTE240M:
++      return 7;
++    case GST_VIDEO_TRANSFER_GAMMA10:
++      return 8;
++    case GST_VIDEO_TRANSFER_LOG100:
++      return 9;
++    case GST_VIDEO_TRANSFER_LOG316:
++      return 10;
++    case GST_VIDEO_TRANSFER_SRGB:
++      return 13;
++    case GST_VIDEO_TRANSFER_BT2020_10:
++      return 14;
++    case GST_VIDEO_TRANSFER_BT2020_12:
++      return 15;
++    case GST_VIDEO_TRANSFER_SMPTE2084:
++      return 16;
++    case GST_VIDEO_TRANSFER_ARIB_STD_B67:
++      return 18;
++    case GST_VIDEO_TRANSFER_GAMMA18:
++    case GST_VIDEO_TRANSFER_GAMMA20:
++    case GST_VIDEO_TRANSFER_ADOBERGB:
++    case GST_VIDEO_TRANSFER_UNKNOWN:
++    default:
++      return 2;
++  }
++}
++
++/**
++ * gst_video_color_primaries_to_iso:
++ * @primaries: a #GstVideoColorPrimaries
++ *
++ * Converts #GstVideoColorPrimaries to the "colour primaries" (ColourPrimaries)
++ * value defined by "ISO/IEC 23001-8 Section 7.1 Table 2"
++ * and "ITU-T H.273 Table 2".
++ * "H.264 Table E-3" and "H.265 Table E.3" share the identical values.
++ *
++ * Returns: The value of ISO/IEC 23001-8 colour primaries.
++ *
++ * Since: 1.18
++ */
++guint
++gst_video_color_primaries_to_iso (GstVideoColorPrimaries primaries)
++{
++  switch (primaries) {
++    case GST_VIDEO_COLOR_PRIMARIES_BT709:
++      return 1;
++    case GST_VIDEO_COLOR_PRIMARIES_BT470M:
++      return 4;
++    case GST_VIDEO_COLOR_PRIMARIES_BT470BG:
++      return 5;
++    case GST_VIDEO_COLOR_PRIMARIES_SMPTE170M:
++      return 6;
++    case GST_VIDEO_COLOR_PRIMARIES_SMPTE240M:
++      return 7;
++    case GST_VIDEO_COLOR_PRIMARIES_FILM:
++      return 8;
++    case GST_VIDEO_COLOR_PRIMARIES_BT2020:
++      return 9;
++    case GST_VIDEO_COLOR_PRIMARIES_SMPTEST428:
++      return 10;
++    case GST_VIDEO_COLOR_PRIMARIES_SMPTERP431:
++      return 11;
++    case GST_VIDEO_COLOR_PRIMARIES_SMPTEEG432:
++      return 12;
++    case GST_VIDEO_COLOR_PRIMARIES_EBU3213:
++      return 22;
++    case GST_VIDEO_COLOR_PRIMARIES_ADOBERGB:
++    case GST_VIDEO_COLOR_PRIMARIES_UNKNOWN:
++    default:
++      return 2;
++  }
++}
++
++/**
++ * gst_video_color_matrix_from_iso:
++ * @value: a ITU-T H.273 matrix coefficients value
++ *
++ * Converts the @value to the #GstVideoColorMatrix
++ * The matrix coefficients (MatrixCoefficients) value is
++ * defined by "ISO/IEC 23001-8 Section 7.3 Table 4"
++ * and "ITU-T H.273 Table 4".
++ * "H.264 Table E-5" and "H.265 Table E.5" share the identical values.
++ *
++ * Returns: the matched #GstVideoColorMatrix
++ *
++ * Since: 1.18
++ */
++GstVideoColorMatrix
++gst_video_color_matrix_from_iso (guint value)
++{
++  switch (value) {
++    case 0:
++      return GST_VIDEO_COLOR_MATRIX_RGB;
++    case 1:
++      return GST_VIDEO_COLOR_MATRIX_BT709;
++    case 4:
++      return GST_VIDEO_COLOR_MATRIX_FCC;
++    case 5:
++    case 6:
++      return GST_VIDEO_COLOR_MATRIX_BT601;
++    case 7:
++      return GST_VIDEO_COLOR_MATRIX_SMPTE240M;
++    case 9:
++      return GST_VIDEO_COLOR_MATRIX_BT2020;
++    case 2:
++    default:
++      return GST_VIDEO_COLOR_MATRIX_UNKNOWN;
++  }
++}
++
++/**
++ * gst_video_color_transfer_from_iso:
++ * @value: a ITU-T H.273 transfer characteristics value
++ *
++ * Converts the @value to the #GstVideoTransferFunction
++ * The transfer characteristics (TransferCharacteristics) value is
++ * defined by "ISO/IEC 23001-8 Section 7.2 Table 3"
++ * and "ITU-T H.273 Table 3".
++ * "H.264 Table E-4" and "H.265 Table E.4" share the identical values.
++ *
++ * Returns: the matched #GstVideoTransferFunction
++ *
++ * Since: 1.18
++ */
++GstVideoTransferFunction
++gst_video_color_transfer_from_iso (guint value)
++{
++  switch (value) {
++    case 1:
++    case 6:
++      return GST_VIDEO_TRANSFER_BT709;
++    case 4:
++      return GST_VIDEO_TRANSFER_GAMMA22;
++    case 5:
++      return GST_VIDEO_TRANSFER_GAMMA28;
++    case 7:
++      return GST_VIDEO_TRANSFER_SMPTE240M;
++    case 8:
++      return GST_VIDEO_TRANSFER_GAMMA10;
++    case 9:
++      return GST_VIDEO_TRANSFER_LOG100;
++    case 10:
++      return GST_VIDEO_TRANSFER_LOG316;
++    case 13:
++      return GST_VIDEO_TRANSFER_SRGB;
++    case 14:
++      return GST_VIDEO_TRANSFER_BT2020_10;
++    case 15:
++      return GST_VIDEO_TRANSFER_BT2020_12;
++    case 16:
++      return GST_VIDEO_TRANSFER_SMPTE2084;
++    case 18:
++      return GST_VIDEO_TRANSFER_ARIB_STD_B67;
++    case 2:
++    default:
++      return GST_VIDEO_TRANSFER_UNKNOWN;
++  }
++}
++
++/**
++ * gst_video_color_primaries_from_iso:
++ * @value: a ITU-T H.273 colour primaries value
++ *
++ * Converts the @value to the #GstVideoColorPrimaries
++ * The colour primaries (ColourPrimaries) value is
++ * defined by "ISO/IEC 23001-8 Section 7.1 Table 2" and "ITU-T H.273 Table 2".
++ * "H.264 Table E-3" and "H.265 Table E.3" share the identical values.
++ *
++ * Returns: the matched #GstVideoColorPrimaries
++ *
++ * Since: 1.18
++ */
++GstVideoColorPrimaries
++gst_video_color_primaries_from_iso (guint value)
++{
++  switch (value) {
++    case 1:
++      return GST_VIDEO_COLOR_PRIMARIES_BT709;
++    case 4:
++      return GST_VIDEO_COLOR_PRIMARIES_BT470M;
++    case 5:
++      return GST_VIDEO_COLOR_PRIMARIES_BT470BG;
++    case 6:
++      return GST_VIDEO_COLOR_PRIMARIES_SMPTE170M;
++    case 7:
++      return GST_VIDEO_COLOR_PRIMARIES_SMPTE240M;
++    case 8:
++      return GST_VIDEO_COLOR_PRIMARIES_FILM;
++    case 9:
++      return GST_VIDEO_COLOR_PRIMARIES_BT2020;
++    case 10:
++      return GST_VIDEO_COLOR_PRIMARIES_SMPTEST428;
++    case 11:
++      return GST_VIDEO_COLOR_PRIMARIES_SMPTERP431;
++    case 12:
++      return GST_VIDEO_COLOR_PRIMARIES_SMPTEEG432;
++    case 22:
++      return GST_VIDEO_COLOR_PRIMARIES_EBU3213;
++    case 2:
++    default:
++      return GST_VIDEO_COLOR_PRIMARIES_UNKNOWN;
++  }
++}
+diff --git a/gst-libs/gst/video/video-color.h b/gst-libs/gst/video/video-color.h
+index 31a7fab..b5adf73 100644
+--- a/gst-libs/gst/video/video-color.h
++++ b/gst-libs/gst/video/video-color.h
+@@ -90,6 +90,16 @@ gboolean gst_video_color_matrix_get_Kr_Kb (GstVideoColorMatrix matrix, gdouble *
+  *                                range. Used for BT.2020 with 12 bits per
+  *                                component. Since: 1.6
+  * @GST_VIDEO_TRANSFER_ADOBERGB: Gamma 2.19921875. Since: 1.8
++ * @GST_VIDEO_TRANSFER_BT2020_10: Rec. ITU-R BT.2020-2 with 10 bits per component.
++ *                                (functionally the same as the values
++ *                                GST_VIDEO_TRANSFER_BT709 and GST_VIDEO_TRANSFER_BT2020_12).
++ *                                Since: 1.18
++ * @GST_VIDEO_TRANSFER_SMPTE2084: SMPTE ST 2084 for 10, 12, 14, and 16-bit systems.
++ *                                Known as perceptual quantization (PQ)
++ *                                Since: 1.18
++ * @GST_VIDEO_TRANSFER_ARIB_STD_B67: Association of Radio Industries and Businesses (ARIB)
++ *                                   STD-B67 and Rec. ITU-R BT.2100-1 hybrid loggamma (HLG) system
++ *                                   Since: 1.18
+  *
+  * The video transfer function defines the formula for converting between
+  * non-linear RGB (R'G'B') and linear RGB
+@@ -107,7 +117,10 @@ typedef enum {
+   GST_VIDEO_TRANSFER_LOG100,
+   GST_VIDEO_TRANSFER_LOG316,
+   GST_VIDEO_TRANSFER_BT2020_12,
+-  GST_VIDEO_TRANSFER_ADOBERGB
++  GST_VIDEO_TRANSFER_ADOBERGB,
++  GST_VIDEO_TRANSFER_BT2020_10,
++  GST_VIDEO_TRANSFER_SMPTE2084,
++  GST_VIDEO_TRANSFER_ARIB_STD_B67
+ } GstVideoTransferFunction;
+ 
+ GST_VIDEO_API
+@@ -205,6 +218,9 @@ typedef struct {
+ #define GST_VIDEO_COLORIMETRY_SMPTE240M   "smpte240m"
+ #define GST_VIDEO_COLORIMETRY_SRGB        "sRGB"
+ #define GST_VIDEO_COLORIMETRY_BT2020      "bt2020"
++#define GST_VIDEO_COLORIMETRY_BT2020_10   "bt2020-10"
++#define GST_VIDEO_COLORIMETRY_BT2100_PQ   "bt2100-pq"
++#define GST_VIDEO_COLORIMETRY_BT2100_HLG  "bt2100-hlg"
+ 
+ GST_VIDEO_API
+ gboolean     gst_video_colorimetry_matches     (const GstVideoColorimetry *cinfo, const gchar *color);
+@@ -226,6 +242,28 @@ void         gst_video_color_range_offsets     (GstVideoColorRange range,
+                                                 gint offset[GST_VIDEO_MAX_COMPONENTS],
+                                                 gint scale[GST_VIDEO_MAX_COMPONENTS]);
+ 
++/* conversion between GStreamer color{matrix,transfer,primaries} enum and
++ * values defined by ISO/IEC 23001-8 and ITU-T H.273 specification.
++ * Also H264 and H265 specifications follow the color{matrix,trasfer,primaries}
++ * values */
++
++GST_VIDEO_API
++guint                     gst_video_color_matrix_to_iso      (GstVideoColorMatrix matrix);
++
++GST_VIDEO_API
++guint                     gst_video_color_transfer_to_iso    (GstVideoTransferFunction func);
++
++GST_VIDEO_API
++guint                     gst_video_color_primaries_to_iso   (GstVideoColorPrimaries primaries);
++
++GST_VIDEO_API
++GstVideoColorMatrix       gst_video_color_matrix_from_iso    (guint value);
++
++GST_VIDEO_API
++GstVideoTransferFunction  gst_video_color_transfer_from_iso  (guint value);
++
++GST_VIDEO_API
++GstVideoColorPrimaries    gst_video_color_primaries_from_iso (guint value);
+ 
+ G_END_DECLS
+ 
+diff --git a/gst-libs/gst/video/video-hdr.c b/gst-libs/gst/video/video-hdr.c
+new file mode 100644
+index 0000000..ca9540f
+--- /dev/null
++++ b/gst-libs/gst/video/video-hdr.c
+@@ -0,0 +1,757 @@
++/* GStreamer
++ * Copyright (C) <2018-2019> Seungha Yang <seungha.yang@navercorp.com>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++#ifdef HAVE_CONFIG_H
++#  include "config.h"
++#endif
++
++#include <string.h>
++#include <gst/base/gstbitreader.h>
++
++#include "video-hdr.h"
++
++#define HDR10_PLUS_MAX_BEZIER_CURVE_ANCHORS 9
++#define HDR10_PLUS_MAX_DIST_MAXRGB_PERCENTILES 9
++
++#define N_ELEMENT_MASTERING_DISPLAY_INFO 10
++#define MASTERING_FORMAT \
++  "%d:%d:" \
++  "%d:%d:" \
++  "%d:%d:" \
++  "%d:%d:" \
++  "%d:%d"
++
++#define MASTERING_PRINTF_ARGS(m) \
++  (m)->display_primaries[0].x, (m)->display_primaries[0].y, \
++  (m)->display_primaries[1].x, (m)->display_primaries[1].y, \
++  (m)->display_primaries[2].x, (m)->display_primaries[2].y, \
++  (m)->white_point.x, (m)->white_point.y, \
++  (m)->max_display_mastering_luminance, \
++  (m)->min_display_mastering_luminance
++
++/* g_ascii_string_to_unsigned is available since 2.54. Get rid of this wrapper
++ * when we bump the version in 1.18 */
++#if !GLIB_CHECK_VERSION(2,54,0)
++#define g_ascii_string_to_unsigned video_hdr_ascii_string_to_unsigned
++static gboolean
++video_hdr_ascii_string_to_unsigned (const gchar * str, guint base, guint64 min,
++    guint64 max, guint64 * out_num, GError ** error)
++{
++  gchar *endptr = NULL;
++  *out_num = g_ascii_strtoull (str, &endptr, base);
++  if (errno)
++    return FALSE;
++  if (endptr == str)
++    return FALSE;
++  return TRUE;
++}
++#endif
++
++/**
++ * gst_video_hdr_format_to_string:
++ * @format: a #GstVideoHDRFormat
++ *
++ * Returns: (nullable): a string containing a descriptive name for
++ * the #GstVideoHDRFormat if there is one, or %NULL otherwise.
++ *
++ * Since: 1.20
++ */
++const gchar *
++gst_video_hdr_format_to_string (GstVideoHDRFormat format)
++{
++  switch (format) {
++    case GST_VIDEO_HDR_FORMAT_HDR10:
++      return "hdr10";
++    case GST_VIDEO_HDR_FORMAT_HDR10_PLUS:
++      return "hdr10+";
++    default:
++      return NULL;
++  }
++}
++
++/**
++ * gst_video_hdr_format_from_string:
++ * @format: (nullable): a #GstVideoHDRFormat
++ *
++ * Returns: the #GstVideoHDRFormat for @format or GST_VIDEO_HDR_FORMAT_NONE when the
++ * string is not a known format.
++ *
++ * Since: 1.20
++ */
++GstVideoHDRFormat
++gst_video_hdr_format_from_string (const gchar * format)
++{
++  if (!g_strcmp0 (format, "hdr10"))
++    return GST_VIDEO_HDR_FORMAT_HDR10;
++  else if (!g_strcmp0 (format, "hdr10+"))
++    return GST_VIDEO_HDR_FORMAT_HDR10_PLUS;
++
++  return GST_VIDEO_HDR_FORMAT_NONE;
++}
++
++/**
++ * gst_video_mastering_display_info_init:
++ * @minfo: a #GstVideoMasteringDisplayInfo
++ *
++ * Initialize @minfo
++ *
++ * Since: 1.18
++ */
++void
++gst_video_mastering_display_info_init (GstVideoMasteringDisplayInfo * minfo)
++{
++  g_return_if_fail (minfo != NULL);
++
++  memset (minfo, 0, sizeof (GstVideoMasteringDisplayInfo));
++}
++
++/**
++ * gst_video_mastering_display_info_from_string:
++ * @minfo: (out): a #GstVideoMasteringDisplayInfo
++ * @mastering: a #GstStructure representing #GstVideoMasteringDisplayInfo
++ *
++ * Extract #GstVideoMasteringDisplayInfo from @mastering
++ *
++ * Returns: %TRUE if @minfo was filled with @mastering
++ *
++ * Since: 1.18
++ */
++gboolean
++gst_video_mastering_display_info_from_string (GstVideoMasteringDisplayInfo *
++    minfo, const gchar * mastering)
++{
++  gboolean ret = FALSE;
++  gchar **split;
++  gint i;
++  gint idx = 0;
++  guint64 val;
++
++  g_return_val_if_fail (minfo != NULL, FALSE);
++  g_return_val_if_fail (mastering != NULL, FALSE);
++
++  split = g_strsplit (mastering, ":", -1);
++
++  if (g_strv_length (split) != N_ELEMENT_MASTERING_DISPLAY_INFO)
++    goto out;
++
++  for (i = 0; i < G_N_ELEMENTS (minfo->display_primaries); i++) {
++    if (!g_ascii_string_to_unsigned (split[idx++],
++            10, 0, G_MAXUINT16, &val, NULL))
++      goto out;
++
++    minfo->display_primaries[i].x = (guint16) val;
++
++    if (!g_ascii_string_to_unsigned (split[idx++],
++            10, 0, G_MAXUINT16, &val, NULL))
++      goto out;
++
++    minfo->display_primaries[i].y = (guint16) val;
++  }
++
++  if (!g_ascii_string_to_unsigned (split[idx++],
++          10, 0, G_MAXUINT16, &val, NULL))
++    goto out;
++
++  minfo->white_point.x = (guint16) val;
++
++  if (!g_ascii_string_to_unsigned (split[idx++],
++          10, 0, G_MAXUINT16, &val, NULL))
++    goto out;
++
++  minfo->white_point.y = (guint16) val;
++
++  if (!g_ascii_string_to_unsigned (split[idx++],
++          10, 0, G_MAXUINT32, &val, NULL))
++    goto out;
++
++  minfo->max_display_mastering_luminance = (guint32) val;
++
++  if (!g_ascii_string_to_unsigned (split[idx++],
++          10, 0, G_MAXUINT32, &val, NULL))
++    goto out;
++
++  minfo->min_display_mastering_luminance = (guint32) val;
++  ret = TRUE;
++
++out:
++  g_strfreev (split);
++  if (!ret)
++    gst_video_mastering_display_info_init (minfo);
++
++  return ret;
++}
++
++/**
++ * gst_video_mastering_display_info_to_string:
++ * @minfo: a #GstVideoMasteringDisplayInfo
++ *
++ * Convert @minfo to its string representation
++ *
++ * Returns: (transfer full): a string representation of @minfo
++ *
++ * Since: 1.18
++ */
++gchar *
++gst_video_mastering_display_info_to_string (const GstVideoMasteringDisplayInfo *
++    minfo)
++{
++  g_return_val_if_fail (minfo != NULL, NULL);
++
++  return g_strdup_printf (MASTERING_FORMAT, MASTERING_PRINTF_ARGS (minfo));
++}
++
++/**
++ * gst_video_mastering_display_info_is_equal:
++ * @minfo: a #GstVideoMasteringDisplayInfo
++ * @other: a #GstVideoMasteringDisplayInfo
++ *
++ * Checks equality between @minfo and @other.
++ *
++ * Returns: %TRUE if @minfo and @other are equal.
++ *
++ * Since: 1.18
++ */
++gboolean
++gst_video_mastering_display_info_is_equal (const GstVideoMasteringDisplayInfo *
++    minfo, const GstVideoMasteringDisplayInfo * other)
++{
++  gint i;
++
++  g_return_val_if_fail (minfo != NULL, FALSE);
++  g_return_val_if_fail (other != NULL, FALSE);
++
++  for (i = 0; i < G_N_ELEMENTS (minfo->display_primaries); i++) {
++    if (minfo->display_primaries[i].x != other->display_primaries[i].x ||
++        minfo->display_primaries[i].y != other->display_primaries[i].y)
++      return FALSE;
++  }
++
++  if (minfo->white_point.x != other->white_point.x ||
++      minfo->white_point.y != other->white_point.y ||
++      minfo->max_display_mastering_luminance !=
++      other->max_display_mastering_luminance
++      || minfo->min_display_mastering_luminance !=
++      other->min_display_mastering_luminance)
++    return FALSE;
++
++  return TRUE;
++}
++
++/**
++ * gst_video_mastering_display_info_from_caps:
++ * @minfo: a #GstVideoMasteringDisplayInfo
++ * @caps: a #GstCaps
++ *
++ * Parse @caps and update @minfo
++ *
++ * Returns: %TRUE if @caps has #GstVideoMasteringDisplayInfo and could be parsed
++ *
++ * Since: 1.18
++ */
++gboolean
++gst_video_mastering_display_info_from_caps (GstVideoMasteringDisplayInfo *
++    minfo, const GstCaps * caps)
++{
++  GstStructure *structure;
++  const gchar *s;
++
++  g_return_val_if_fail (minfo != NULL, FALSE);
++  g_return_val_if_fail (GST_IS_CAPS (caps), FALSE);
++
++  structure = gst_caps_get_structure (caps, 0);
++
++  if ((s = gst_structure_get_string (structure,
++              "mastering-display-info")) == NULL)
++    return FALSE;
++
++  return gst_video_mastering_display_info_from_string (minfo, s);
++}
++
++/**
++ * gst_video_mastering_display_info_add_to_caps:
++ * @minfo: a #GstVideoMasteringDisplayInfo
++ * @caps: a #GstCaps
++ *
++ * Set string representation of @minfo to @caps
++ *
++ * Returns: %TRUE if @minfo was successfully set to @caps
++ *
++ * Since: 1.18
++ */
++gboolean
++gst_video_mastering_display_info_add_to_caps (const GstVideoMasteringDisplayInfo
++    * minfo, GstCaps * caps)
++{
++  gchar *s;
++
++  g_return_val_if_fail (minfo != NULL, FALSE);
++  g_return_val_if_fail (GST_IS_CAPS (caps), FALSE);
++  g_return_val_if_fail (gst_caps_is_writable (caps), FALSE);
++
++  s = gst_video_mastering_display_info_to_string (minfo);
++  if (!s)
++    return FALSE;
++
++  gst_caps_set_simple (caps, "mastering-display-info", G_TYPE_STRING, s, NULL);
++  g_free (s);
++
++  return TRUE;
++}
++
++/**
++ * gst_video_content_light_level_init:
++ * @linfo: a #GstVideoContentLightLevel
++ *
++ * Initialize @linfo
++ *
++ * Since: 1.18
++ */
++void
++gst_video_content_light_level_init (GstVideoContentLightLevel * linfo)
++{
++  g_return_if_fail (linfo != NULL);
++
++  memset (linfo, 0, sizeof (GstVideoContentLightLevel));
++}
++
++/**
++ * gst_video_content_light_level_from_string:
++ * @linfo: a #GstVideoContentLightLevel
++ * @level: a content-light-level string from caps
++ *
++ * Parse the value of content-light-level caps field and update @minfo
++ * with the parsed values.
++ *
++ * Returns: %TRUE if @linfo points to valid #GstVideoContentLightLevel.
++ *
++ * Since: 1.18
++ */
++gboolean
++gst_video_content_light_level_from_string (GstVideoContentLightLevel * linfo,
++    const gchar * level)
++{
++  gboolean ret = FALSE;
++  gchar **split;
++  guint64 val;
++
++  g_return_val_if_fail (linfo != NULL, FALSE);
++  g_return_val_if_fail (level != NULL, FALSE);
++
++  split = g_strsplit (level, ":", -1);
++
++  if (g_strv_length (split) != 2)
++    goto out;
++
++  if (!g_ascii_string_to_unsigned (split[0], 10, 0, G_MAXUINT16, &val, NULL))
++    goto out;
++
++  linfo->max_content_light_level = (guint16) val;
++
++  if (!g_ascii_string_to_unsigned (split[1], 10, 0, G_MAXUINT16, &val, NULL))
++    goto out;
++
++  linfo->max_frame_average_light_level = (guint16) val;
++
++  ret = TRUE;
++
++out:
++  g_strfreev (split);
++  if (!ret)
++    gst_video_content_light_level_init (linfo);
++
++  return ret;
++}
++
++/**
++ * gst_video_content_light_level_to_string:
++ * @linfo: a #GstVideoContentLightLevel
++ *
++ * Convert @linfo to its string representation.
++ *
++ * Returns: (transfer full): a string representation of @linfo.
++ *
++ * Since: 1.18
++ */
++gchar *
++gst_video_content_light_level_to_string (const GstVideoContentLightLevel *
++    linfo)
++{
++  g_return_val_if_fail (linfo != NULL, NULL);
++
++  return g_strdup_printf ("%d:%d",
++      linfo->max_content_light_level, linfo->max_frame_average_light_level);
++}
++
++/**
++ * gst_video_content_light_level_from_caps:
++ * @linfo: a #GstVideoContentLightLevel
++ * @caps: a #GstCaps
++ *
++ * Parse @caps and update @linfo
++ *
++ * Returns: if @caps has #GstVideoContentLightLevel and could be parsed
++ *
++ * Since: 1.18
++ */
++gboolean
++gst_video_content_light_level_from_caps (GstVideoContentLightLevel * linfo,
++    const GstCaps * caps)
++{
++  GstStructure *structure;
++  const gchar *s;
++
++  g_return_val_if_fail (linfo != NULL, FALSE);
++  g_return_val_if_fail (GST_IS_CAPS (caps), FALSE);
++
++  structure = gst_caps_get_structure (caps, 0);
++
++  if ((s = gst_structure_get_string (structure, "content-light-level")) == NULL)
++    return FALSE;
++
++  return gst_video_content_light_level_from_string (linfo, s);
++}
++
++/**
++ * gst_video_content_light_level_add_to_caps:
++ * @linfo: a #GstVideoContentLightLevel
++ * @caps: a #GstCaps
++ *
++ * Parse @caps and update @linfo
++ *
++ * Returns: %TRUE if @linfo was successfully set to @caps
++ *
++ * Since: 1.18
++ */
++gboolean
++gst_video_content_light_level_add_to_caps (const GstVideoContentLightLevel *
++    linfo, GstCaps * caps)
++{
++  gchar *s;
++
++  g_return_val_if_fail (linfo != NULL, FALSE);
++  g_return_val_if_fail (GST_IS_CAPS (caps), FALSE);
++  g_return_val_if_fail (gst_caps_is_writable (caps), FALSE);
++
++  s = gst_video_content_light_level_to_string (linfo);
++  gst_caps_set_simple (caps, "content-light-level", G_TYPE_STRING, s, NULL);
++  g_free (s);
++
++  return TRUE;
++}
++
++/* Dynamic HDR Meta implementation */
++
++GType
++gst_video_hdr_meta_api_get_type (void)
++{
++  static volatile GType type = 0;
++
++  if (g_once_init_enter (&type)) {
++    static const gchar *tags[] = {
++      GST_META_TAG_VIDEO_STR,
++      NULL
++    };
++    GType _type = gst_meta_api_type_register ("GstVideoHDRMetaAPI", tags);
++    g_once_init_leave (&type, _type);
++  }
++  return type;
++}
++
++static gboolean
++gst_video_hdr_meta_transform (GstBuffer * dest, GstMeta * meta,
++    GstBuffer * buffer, GQuark type, gpointer data)
++{
++  GstVideoHDRMeta *dmeta, *smeta;
++
++  /* We always copy over the caption meta */
++  smeta = (GstVideoHDRMeta *) meta;
++
++  GST_DEBUG ("copy HDR metadata");
++  dmeta =
++      gst_buffer_add_video_hdr_meta (dest, smeta->format, smeta->data,
++      smeta->size);
++  if (!dmeta)
++    return FALSE;
++
++  return TRUE;
++}
++
++static gboolean
++gst_video_hdr_meta_init (GstMeta * meta, gpointer params, GstBuffer * buffer)
++{
++  GstVideoHDRMeta *emeta = (GstVideoHDRMeta *) meta;
++
++  emeta->data = NULL;
++
++  return TRUE;
++}
++
++static void
++gst_video_hdr_meta_free (GstMeta * meta, GstBuffer * buffer)
++{
++  GstVideoHDRMeta *emeta = (GstVideoHDRMeta *) meta;
++
++  g_free (emeta->data);
++}
++
++const GstMetaInfo *
++gst_video_hdr_meta_get_info (void)
++{
++  static const GstMetaInfo *meta_info = NULL;
++
++  if (g_once_init_enter ((GstMetaInfo **) & meta_info)) {
++    const GstMetaInfo *mi = gst_meta_register (GST_VIDEO_HDR_META_API_TYPE,
++        "GstVideoHDRMeta",
++        sizeof (GstVideoHDRMeta),
++        gst_video_hdr_meta_init,
++        gst_video_hdr_meta_free,
++        gst_video_hdr_meta_transform);
++    g_once_init_leave ((GstMetaInfo **) & meta_info, (GstMetaInfo *) mi);
++  }
++  return meta_info;
++}
++
++/**
++ * gst_buffer_add_video_hdr_meta:
++ * @buffer: a #GstBuffer
++ * @format: The type of dynamic HDR contained in the meta.
++ * @data: contains the dynamic HDR data
++ * @size: The size in bytes of @data
++ *
++ * Attaches #GstVideoHDRMeta metadata to @buffer with the given
++ * parameters.
++ *
++ * Returns: (transfer none): the #GstVideoHDRMeta on @buffer.
++ *
++ * Since: 1.20
++ */
++GstVideoHDRMeta *
++gst_buffer_add_video_hdr_meta (GstBuffer * buffer,
++    GstVideoHDRFormat format, const guint8 * data, gsize size)
++{
++  GstVideoHDRMeta *meta;
++
++  g_return_val_if_fail (GST_IS_BUFFER (buffer), NULL);
++  g_return_val_if_fail (data != NULL, NULL);
++
++  meta = (GstVideoHDRMeta *) gst_buffer_add_meta (buffer,
++      GST_VIDEO_HDR_META_INFO, NULL);
++  g_assert (meta != NULL);
++
++  meta->format = format;
++  meta->data = g_memdup (data, size);
++  meta->size = size;
++
++  return meta;
++}
++
++#define CHECK_HDR10PLUS_REMAINING(br, needed) \
++if (gst_bit_reader_get_remaining (&br) < needed) { \
++  GST_DEBUG ("Not enough bits remaining %d, needed %d", gst_bit_reader_get_remaining (&br), needed); \
++  return FALSE; \
++}
++
++/**
++ * gst_video_hdr_parse_hdr10_plus:
++ * @data: HDR10+ data
++ * @size: size of data
++ * @hdr10_plus: (out): #GstVideoHDR10Plus structure to fill in.
++ *
++ * Parse HDR10+ (SMPTE2094-40) user data and store in @hdr10_plus
++ * For more details, see:
++ * https://www.atsc.org/wp-content/uploads/2018/02/S34-301r2-A341-Amendment-2094-40-1.pdf
++ * and SMPTE ST2094-40
++ *
++ * Returns: %TRUE if @data was successfully parsed to @hdr10_plus
++ *
++ * Since: 1.20
++ */
++gboolean
++gst_video_hdr_parse_hdr10_plus (const guint8 * data, gsize size,
++    GstVideoHDR10Plus * hdr10_plus)
++{
++  guint16 provider_oriented_code;
++  int w, i, j;
++  GstBitReader br;
++
++  /* there must be at least one byte, and not more than GST_VIDEO_HDR10_PLUS_MAX_BYTES bytes */
++  g_return_val_if_fail (data != NULL, FALSE);
++
++  memset (hdr10_plus, 0, sizeof (GstVideoHDR10Plus));
++  gst_bit_reader_init (&br, data, size);
++  GST_MEMDUMP ("HDR10+", data, size);
++  CHECK_HDR10PLUS_REMAINING (br, 2 + 8 + 8 + 2);
++  provider_oriented_code = gst_bit_reader_get_bits_uint16_unchecked (&br, 16);
++  if (provider_oriented_code != 0x0001)
++    return FALSE;
++
++
++  hdr10_plus->application_identifier =
++      gst_bit_reader_get_bits_uint8_unchecked (&br, 8);
++  hdr10_plus->application_version =
++      gst_bit_reader_get_bits_uint8_unchecked (&br, 8);
++  hdr10_plus->num_windows = gst_bit_reader_get_bits_uint8_unchecked (&br, 2);
++  if (hdr10_plus->num_windows != GST_VIDEO_HDR10_PLUS_NUM_WINDOWS)
++    return FALSE;
++  for (w = 0; w < hdr10_plus->num_windows; w++) {
++    CHECK_HDR10PLUS_REMAINING (br,
++        16 + 16 + 16 + 16 + 16 + 16 + 8 + 16 + 16 + 16 + 1);
++    hdr10_plus->processing_window[w].window_upper_left_corner_x =
++        gst_bit_reader_get_bits_uint16_unchecked (&br, 16);
++    hdr10_plus->processing_window[w].window_upper_left_corner_y =
++        gst_bit_reader_get_bits_uint16_unchecked (&br, 16);
++    hdr10_plus->processing_window[w].window_lower_right_corner_x =
++        gst_bit_reader_get_bits_uint16_unchecked (&br, 16);
++    hdr10_plus->processing_window[w].window_lower_right_corner_y =
++        gst_bit_reader_get_bits_uint16_unchecked (&br, 16);
++    hdr10_plus->processing_window[w].center_of_ellipse_x =
++        gst_bit_reader_get_bits_uint16_unchecked (&br, 16);
++    hdr10_plus->processing_window[w].center_of_ellipse_y =
++        gst_bit_reader_get_bits_uint16_unchecked (&br, 16);
++    hdr10_plus->processing_window[w].rotation_angle =
++        gst_bit_reader_get_bits_uint8_unchecked (&br, 8);
++    hdr10_plus->processing_window[w].semimajor_axis_internal_ellipse =
++        gst_bit_reader_get_bits_uint16_unchecked (&br, 16);
++    hdr10_plus->processing_window[w].semimajor_axis_external_ellipse =
++        gst_bit_reader_get_bits_uint16_unchecked (&br, 16);
++    hdr10_plus->processing_window[w].semiminor_axis_external_ellipse =
++        gst_bit_reader_get_bits_uint16_unchecked (&br, 16);
++    hdr10_plus->processing_window[w].overlap_process_option =
++        gst_bit_reader_get_bits_uint8_unchecked (&br, 1);
++  }
++  CHECK_HDR10PLUS_REMAINING (br, 27 + 1);
++  hdr10_plus->targeted_system_display_maximum_luminance =
++      gst_bit_reader_get_bits_uint32_unchecked (&br, 27);
++  hdr10_plus->targeted_system_display_actual_peak_luminance_flag =
++      gst_bit_reader_get_bits_uint8_unchecked (&br, 1);
++  if (hdr10_plus->targeted_system_display_actual_peak_luminance_flag) {
++    CHECK_HDR10PLUS_REMAINING (br, 5 + 5);
++    hdr10_plus->num_rows_targeted_system_display_actual_peak_luminance =
++        gst_bit_reader_get_bits_uint8_unchecked (&br, 5);
++    hdr10_plus->num_cols_targeted_system_display_actual_peak_luminance =
++        gst_bit_reader_get_bits_uint8_unchecked (&br, 5);
++    if (hdr10_plus->num_rows_targeted_system_display_actual_peak_luminance >
++        GST_VIDEO_HDR10_PLUS_MAX_ROWS_TSD_APL)
++      return FALSE;
++    if (hdr10_plus->num_cols_targeted_system_display_actual_peak_luminance >
++        GST_VIDEO_HDR10_PLUS_MAX_COLS_MD_APL)
++      return FALSE;
++    CHECK_HDR10PLUS_REMAINING (br,
++        hdr10_plus->num_rows_targeted_system_display_actual_peak_luminance *
++        hdr10_plus->num_cols_targeted_system_display_actual_peak_luminance * 4);
++    for (i = 0;
++        i < hdr10_plus->num_rows_targeted_system_display_actual_peak_luminance;
++        i++) {
++      for (j = 0;
++          j <
++          hdr10_plus->num_cols_targeted_system_display_actual_peak_luminance;
++          j++)
++        hdr10_plus->targeted_system_display_actual_peak_luminance[i][j] =
++            gst_bit_reader_get_bits_uint8_unchecked (&br, 4);
++    }
++    for (w = 0; w < hdr10_plus->num_windows; w++) {
++      CHECK_HDR10PLUS_REMAINING (br, (17 * 3));
++      for (i = 0; i < 3; i++)
++        hdr10_plus->processing_window[w].maxscl[i] =
++            gst_bit_reader_get_bits_uint32_unchecked (&br, 17);
++      CHECK_HDR10PLUS_REMAINING (br, 17 + 4);
++      hdr10_plus->processing_window[w].average_maxrgb =
++          gst_bit_reader_get_bits_uint32_unchecked (&br, 17);
++      hdr10_plus->processing_window[w].num_distribution_maxrgb_percentiles =
++          gst_bit_reader_get_bits_uint8_unchecked (&br, 4);
++      if (hdr10_plus->processing_window[w].
++          num_distribution_maxrgb_percentiles !=
++          HDR10_PLUS_MAX_DIST_MAXRGB_PERCENTILES)
++        return FALSE;
++      CHECK_HDR10PLUS_REMAINING (br,
++          hdr10_plus->processing_window[w].num_distribution_maxrgb_percentiles *
++          (17 + 7));
++      for (i = 0;
++          i <
++          hdr10_plus->processing_window[w].num_distribution_maxrgb_percentiles;
++          i++) {
++        hdr10_plus->processing_window[w].distribution_maxrgb_percentages[i] =
++            gst_bit_reader_get_bits_uint8_unchecked (&br, 7);
++        hdr10_plus->processing_window[w].distribution_maxrgb_percentiles[i] =
++            gst_bit_reader_get_bits_uint32_unchecked (&br, 17);
++      }
++      CHECK_HDR10PLUS_REMAINING (br, 10)
++          hdr10_plus->processing_window[w].fraction_bright_pixels =
++          gst_bit_reader_get_bits_uint16_unchecked (&br, 10);
++    }
++  }
++  CHECK_HDR10PLUS_REMAINING (br, 1)
++      hdr10_plus->mastering_display_actual_peak_luminance_flag =
++      gst_bit_reader_get_bits_uint8_unchecked (&br, 1);
++  if (hdr10_plus->targeted_system_display_actual_peak_luminance_flag) {
++    CHECK_HDR10PLUS_REMAINING (br, 5 + 5)
++        hdr10_plus->num_rows_mastering_display_actual_peak_luminance =
++        gst_bit_reader_get_bits_uint8_unchecked (&br, 5);
++    hdr10_plus->num_cols_mastering_display_actual_peak_luminance =
++        gst_bit_reader_get_bits_uint8_unchecked (&br, 5);
++    if (hdr10_plus->num_rows_mastering_display_actual_peak_luminance >
++        GST_VIDEO_HDR10_PLUS_MAX_ROWS_TSD_APL)
++      return FALSE;
++    if (hdr10_plus->num_cols_mastering_display_actual_peak_luminance >
++        GST_VIDEO_HDR10_PLUS_MAX_COLS_MD_APL)
++      return FALSE;
++    CHECK_HDR10PLUS_REMAINING (br,
++        hdr10_plus->num_rows_mastering_display_actual_peak_luminance *
++        hdr10_plus->num_cols_mastering_display_actual_peak_luminance * 4)
++        for (i = 0;
++        i < hdr10_plus->num_rows_mastering_display_actual_peak_luminance; i++) {
++      for (j = 0;
++          j < hdr10_plus->num_cols_mastering_display_actual_peak_luminance; j++)
++        hdr10_plus->mastering_display_actual_peak_luminance[i][j] =
++            gst_bit_reader_get_bits_uint8_unchecked (&br, 4);
++    }
++    for (w = 0; w < hdr10_plus->num_windows; w++) {
++      CHECK_HDR10PLUS_REMAINING (br, 1)
++          hdr10_plus->processing_window[w].tone_mapping_flag =
++          gst_bit_reader_get_bits_uint8_unchecked (&br, 1);
++      if (hdr10_plus->processing_window[w].tone_mapping_flag) {
++        CHECK_HDR10PLUS_REMAINING (br, 12 + 12 + 4)
++            hdr10_plus->processing_window[w].knee_point_x =
++            gst_bit_reader_get_bits_uint16_unchecked (&br, 12);
++        hdr10_plus->processing_window[w].knee_point_y =
++            gst_bit_reader_get_bits_uint16_unchecked (&br, 12);
++        hdr10_plus->processing_window[w].num_bezier_curve_anchors =
++            gst_bit_reader_get_bits_uint8_unchecked (&br, 4);
++        if (hdr10_plus->processing_window[w].num_bezier_curve_anchors >
++            HDR10_PLUS_MAX_BEZIER_CURVE_ANCHORS)
++          return FALSE;
++        CHECK_HDR10PLUS_REMAINING (br,
++            10 * hdr10_plus->processing_window[w].num_bezier_curve_anchors);
++        for (i = 0;
++            i < hdr10_plus->processing_window[w].num_bezier_curve_anchors; i++)
++          hdr10_plus->processing_window[w].bezier_curve_anchors[i] =
++              gst_bit_reader_get_bits_uint16_unchecked (&br, 10);
++      }
++      CHECK_HDR10PLUS_REMAINING (br, 1);
++      hdr10_plus->processing_window[w].color_saturation_mapping_flag =
++          gst_bit_reader_get_bits_uint8_unchecked (&br, 1);
++      if (hdr10_plus->processing_window[w].color_saturation_mapping_flag) {
++        CHECK_HDR10PLUS_REMAINING (br, 6);
++        hdr10_plus->processing_window[w].color_saturation_weight =
++            gst_bit_reader_get_bits_uint8_unchecked (&br, 6);
++      }
++    }
++  }
++  return TRUE;
++}
+diff --git a/gst-libs/gst/video/video-hdr.h b/gst-libs/gst/video/video-hdr.h
+new file mode 100644
+index 0000000..6b3a915
+--- /dev/null
++++ b/gst-libs/gst/video/video-hdr.h
+@@ -0,0 +1,404 @@
++/* GStreamer
++ * Copyright (C) <2018-2019> Seungha Yang <seungha.yang@navercorp.com>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++#ifndef __GST_VIDEO_HDR_H__
++#define __GST_VIDEO_HDR_H__
++
++#include <gst/gst.h>
++#include <gst/video/video-prelude.h>
++#include <gst/video/video-info.h>
++
++G_BEGIN_DECLS
++
++/**
++ * GstVideoHDRFormat:
++ * @GST_VIDEO_HDR_FORMAT_NONE: No HDR format detected.
++ * @GST_VIDEO_HDR_FORMAT_HDR10: HDR10 format
++ * @GST_VIDEO_HDR_FORMAT_HDR10_PLUS: HDR10+ format
++ * @GST_VIDEO_HDR_FORMAT_DOLBY_VISION: Dolby Vision format
++ *
++ * Enum value describing the most common video for High Dynamic Range (HDR) formats.
++ *
++ * Since: 1.20
++ */
++typedef enum {
++  GST_VIDEO_HDR_FORMAT_NONE,
++  GST_VIDEO_HDR_FORMAT_HDR10,
++  GST_VIDEO_HDR_FORMAT_HDR10_PLUS,
++  GST_VIDEO_HDR_FORMAT_DOLBY_VISION,
++} GstVideoHDRFormat;
++
++/**
++ * GST_VIDEO_HDR10_PLUS_MAX_BYTES:
++ *
++ * Specify the max size for a HDR10+ content
++ *
++ * Since: 1.20
++ */
++#define GST_VIDEO_HDR10_PLUS_MAX_BYTES 1024
++
++/**
++ * GST_VIDEO_HDR10_PLUS_NUM_WINDOWS:
++ *
++ * Number of windows in HDR10+ dynamic metadata.
++ * Defined in CTA-861-G.
++ * Shall be 1.
++ *
++ * Since: 1.20
++ */
++#define GST_VIDEO_HDR10_PLUS_NUM_WINDOWS 1
++
++/**
++ * GST_VIDEO_HDR10_PLUS_MAX_ROWS_TSD_APL:
++ *
++ * Specifies the number of columns in the
++ * targeted_system_display_actual_peak_luminance
++ * array.
++ * Defined in CTA-861-G.
++ *
++ * Since: 1.20
++ */
++#define GST_VIDEO_HDR10_PLUS_MAX_ROWS_TSD_APL 25
++
++/**
++ * GST_VIDEO_HDR10_PLUS_MAX_COLS_MD_APL:
++ *
++ * Specifies the number of columns in the
++ * targeted_system_display_actual_peak_luminance
++ * array.
++ * Defined in CTA-861-G.
++ *
++ *
++ * Since: 1.20
++ */
++#define GST_VIDEO_HDR10_PLUS_MAX_COLS_MD_APL 25
++
++typedef struct _GstVideoMasteringDisplayInfoCoordinates GstVideoMasteringDisplayInfoCoordinates;
++typedef struct _GstVideoMasteringDisplayInfo GstVideoMasteringDisplayInfo;
++typedef struct _GstVideoContentLightLevel GstVideoContentLightLevel;
++typedef struct _GstVideoHDR10Plus GstVideoHDR10Plus;
++typedef struct _GstVideoColorVolumeTransformation GstVideoColorVolumeTransformation;
++
++GST_VIDEO_API
++const gchar* gst_video_hdr_format_to_string (GstVideoHDRFormat format) G_GNUC_CONST;
++
++GST_VIDEO_API
++GstVideoHDRFormat gst_video_hdr_format_from_string (const gchar* format) G_GNUC_CONST;
++
++/**
++ * GstVideoHDRMeta:
++ * @meta: parent #GstMeta
++ * @format: The type of dynamic HDR contained in the meta.
++ * @data: contains the dynamic HDR data
++ * @size: The size in bytes of @data
++ *
++ * Dynamic HDR data should be included in video user data
++ *
++ * Since: 1.20
++ */
++typedef struct {
++  GstMeta meta;
++  GstVideoHDRFormat format;
++  guint8 *data;
++  gsize size;
++} GstVideoHDRMeta;
++
++/**
++ * gst_video_hdr_meta_api_get_type: (attributes doc.skip=true)
++ */
++GST_VIDEO_API
++GType gst_video_hdr_meta_api_get_type (void);
++
++/**
++ * GST_VIDEO_HDR_META_API_TYPE: (attributes doc.skip=true)
++ */
++#define GST_VIDEO_HDR_META_API_TYPE (gst_video_hdr_meta_api_get_type())
++
++/**
++ * gst_video_hdr_meta_get_info: (attributes doc.skip=true)
++ */
++GST_VIDEO_API
++const GstMetaInfo *gst_video_hdr_meta_get_info (void);
++
++/**
++ * GST_VIDEO_HDR_META_INFO: (attributes doc.skip=true)
++ */
++#define GST_VIDEO_HDR_META_INFO (gst_video_hdr_meta_get_info())
++
++/**
++ * gst_buffer_get_video_hdr_meta:
++ * @b: A #GstBuffer
++ *
++ * Gets the #GstVideoHDRMeta that might be present on @b.
++ *
++ * Since: 1.20
++ *
++ * Returns: The first #GstVideoHDRMeta present on @b, or %NULL if
++ * no #GstVideoHDRMeta are present
++ */
++#define gst_buffer_get_video_hdr_meta(b) \
++        ((GstVideoHDRMeta*)gst_buffer_get_meta((b), GST_VIDEO_HDR_META_API_TYPE))
++
++GST_VIDEO_API
++GstVideoHDRMeta *gst_buffer_add_video_hdr_meta (GstBuffer * buffer, GstVideoHDRFormat format,
++                                                const guint8 * data, gsize size);
++
++/**
++ * GstVideoMasteringDisplayInfoCoordinates:
++ * @x: the x coordinate of CIE 1931 color space in unit of 0.00002.
++ * @y: the y coordinate of CIE 1931 color space in unit of 0.00002.
++ *
++ * Used to represent display_primaries and white_point of
++ * #GstVideoMasteringDisplayInfo struct. See #GstVideoMasteringDisplayInfo
++ *
++ * Since: 1.18
++ */
++struct _GstVideoMasteringDisplayInfoCoordinates
++{
++  guint16 x;
++  guint16 y;
++};
++
++/**
++ * GstVideoMasteringDisplayInfo:
++ * @display_primaries: the xy coordinates of primaries in the CIE 1931 color space.
++ *   the index 0 contains red, 1 is for green and 2 is for blue.
++ *   each value is normalized to 50000 (meaning that in unit of 0.00002)
++ * @white_point: the xy coordinates of white point in the CIE 1931 color space.
++ *   each value is normalized to 50000 (meaning that in unit of 0.00002)
++ * @max_display_mastering_luminance: the maximum value of display luminance
++ *   in unit of 0.0001 candelas per square metre (cd/m^2 and nit)
++ * @min_display_mastering_luminance: the minimum value of display luminance
++ *   in unit of 0.0001 candelas per square metre (cd/m^2 and nit)
++ *
++ * Mastering display color volume information defined by SMPTE ST 2086
++ * (a.k.a static HDR metadata).
++ *
++ * Since: 1.18
++ */
++struct _GstVideoMasteringDisplayInfo
++{
++  GstVideoMasteringDisplayInfoCoordinates display_primaries[3];
++  GstVideoMasteringDisplayInfoCoordinates white_point;
++  guint32 max_display_mastering_luminance;
++  guint32 min_display_mastering_luminance;
++
++  /*< private >*/
++  gpointer _gst_reserved[GST_PADDING];
++};
++
++GST_VIDEO_API
++void      gst_video_mastering_display_info_init         (GstVideoMasteringDisplayInfo * minfo);
++
++GST_VIDEO_API
++gboolean  gst_video_mastering_display_info_from_string  (GstVideoMasteringDisplayInfo * minfo,
++                                                         const gchar * mastering);
++
++GST_VIDEO_API
++gchar *   gst_video_mastering_display_info_to_string    (const GstVideoMasteringDisplayInfo * minfo);
++
++GST_VIDEO_API
++gboolean  gst_video_mastering_display_info_is_equal     (const GstVideoMasteringDisplayInfo * minfo,
++                                                         const GstVideoMasteringDisplayInfo * other);
++
++GST_VIDEO_API
++gboolean  gst_video_mastering_display_info_from_caps    (GstVideoMasteringDisplayInfo * minfo,
++                                                         const GstCaps * caps);
++
++GST_VIDEO_API
++gboolean  gst_video_mastering_display_info_add_to_caps  (const GstVideoMasteringDisplayInfo * minfo,
++                                                         GstCaps * caps);
++
++/**
++ * GstVideoContentLightLevel:
++ * @max_content_light_level: the maximum content light level
++ *   (abbreviated to MaxCLL) in candelas per square meter (cd/m^2 and nit)
++ * @max_frame_average_light_level: the maximum frame average light level
++ *   (abbreviated to MaxFLL) in candelas per square meter (cd/m^2 and nit)
++ *
++ * Content light level information specified in CEA-861.3, Appendix A.
++ *
++ * Since: 1.18
++ */
++struct _GstVideoContentLightLevel
++{
++  guint16 max_content_light_level;
++  guint16 max_frame_average_light_level;
++
++  /*< private >*/
++  gpointer _gst_reserved[GST_PADDING];
++};
++
++GST_VIDEO_API
++void      gst_video_content_light_level_init         (GstVideoContentLightLevel * linfo);
++
++GST_VIDEO_API
++gboolean  gst_video_content_light_level_from_string  (GstVideoContentLightLevel * linfo,
++                                                      const gchar * level);
++
++GST_VIDEO_API
++gchar *   gst_video_content_light_level_to_string    (const GstVideoContentLightLevel * linfo);
++
++GST_VIDEO_API
++gboolean  gst_video_content_light_level_from_caps    (GstVideoContentLightLevel * linfo,
++                                                      const GstCaps * caps);
++
++GST_VIDEO_API
++gboolean  gst_video_content_light_level_add_to_caps  (const GstVideoContentLightLevel * linfo,
++                                                      GstCaps * caps);
++
++/**
++ * GstVideoColorVolumeTransformation:
++ * @window_upper_left_corner_x: the x coordinate of the top left pixel of the w-th processing
++ * @window_upper_left_corner_y: the y coordinate of the top left pixel of the w-th processing
++ * @window_lower_right_corner_x: the x coordinate of the lower right pixel of the w-th processing
++ * @window_lower_right_corner_y: the y coordinate of the lower right pixel of the w-th processing
++ * @center_of_ellipse_x: the x coordinate of the center position of the concentric internal
++ * and external ellipses of the elliptical pixel selector in the w-th processing window
++ * @center_of_ellipse_y: the y coordinate of the center position of the concentric internal
++ * and external ellipses of the elliptical pixel selector in the w-th processing window
++ * @rotation_angle: the clockwise rotation angle in degree of arc with respect to the
++ * positive direction of the x-axis of the concentric internal and external ellipses of the elliptical
++ * pixel selector in the w-th processing window
++ * @semimajor_axis_internal_ellipse: the semi-major axis value of the internal ellipse of the
++ * elliptical pixel selector in amount of pixels in the w-th processing window
++ * @semimajor_axis_external_ellipse: the semi-major axis value of the external ellipse of
++ * the elliptical pixel selector in amount of pixels in the w-th processing window
++ * @semiminor_axis_external_ellipse: the semi-minor axis value of the external ellipse of
++ * the elliptical pixel selector in amount of pixels in the w-th processing window
++ * @overlap_process_option: one of the two methods of combining
++ * rendered pixels in the w-th processing window in an image with at least one elliptical pixel
++ * selector
++ * @maxscl: the maximum of the i-th color component of linearized RGB values in the
++ * w-th processing window in the scene
++ * @average_maxrgb: the average of linearized maxRGB values in the w-th processing
++ * window in the scene
++ * @num_distribution_maxrgb_percentiles: the number of linearized maxRGB values at
++ * given percentiles in the w-th processing window in the scene. Maximum value should be 9.
++ * @distribution_maxrgb_percentages: an integer percentage value corresponding to the
++ * i-th percentile linearized RGB value in the w-th processing window in the scene
++ * @fraction_bright_pixels: the fraction of selected pixels in the image that contains the
++ * brightest pixel in the scene
++ * @tone_mapping_flag: true if the tone mapping function in the w-th
++ * processing window is present
++ * @knee_point_x: the x coordinate of the separation point between the linear part and the
++ * curved part of the tone mapping function
++ * @knee_point_y: the y coordinate of the separation point between the linear part and the
++ * curved part of the tone mapping function
++ * @num_bezier_curve_anchors: the number of the intermediate anchor parameters of the
++ * tone mapping function in the w-th processing window. Maximum value should be 9.
++ * @bezier_curve_anchors: the i-th intermediate anchor parameter of the tone mapping
++function in the w-th processing window in the scene
++ * @color_saturation_mapping_flag: shall be equal to zero in this version of the standard.
++ * @color_saturation_weight: a number that shall adjust the color saturation gain in the w-
++th processing window in the scene
++ *
++ * Processing window in dynamic metadata defined in SMPTE ST 2094-40:2016
++ * and CTA-861-G Annex S HDR Dynamic Metadata Syntax Type 4.
++ *
++ * Since: 1.20
++ */
++struct _GstVideoColorVolumeTransformation
++{
++  guint16 window_upper_left_corner_x;
++  guint16 window_upper_left_corner_y;
++  guint16 window_lower_right_corner_x;
++  guint16 window_lower_right_corner_y;
++  guint16 center_of_ellipse_x;
++  guint16 center_of_ellipse_y;
++  guint8  rotation_angle;
++  guint16 semimajor_axis_internal_ellipse;
++  guint16 semimajor_axis_external_ellipse;
++  guint16 semiminor_axis_external_ellipse;
++  guint8 overlap_process_option;
++  guint32 maxscl[3];
++  guint32 average_maxrgb;
++  guint8 num_distribution_maxrgb_percentiles;
++  guint8 distribution_maxrgb_percentages[16];
++  guint32 distribution_maxrgb_percentiles[16];
++  guint16 fraction_bright_pixels;
++  guint8 tone_mapping_flag;
++  guint16 knee_point_x;
++  guint16 knee_point_y;
++  guint8 num_bezier_curve_anchors;
++  guint16 bezier_curve_anchors[16];
++  guint8 color_saturation_mapping_flag;
++  guint8 color_saturation_weight;
++
++  /*< private >*/
++  guint32 _gst_reserved[GST_PADDING];
++};
++
++/**
++ * GstVideoHDR10Plus:
++ * @application_identifier: the application identifier
++ * @application_version: the application version
++ * @num_windows: the number of processing windows. The first processing window shall be
++ * for the entire picture
++ * @processing_window: the color volume transformation for the processing window.
++ * @targeted_system_display_maximum_luminance: the nominal maximum display luminance
++ * of the targeted system display in units of 0.0001 candelas per square meter
++ * @targeted_system_display_actual_peak_luminance_flag: shall be equal to zero in this
++ * version of the standard
++ * @num_rows_targeted_system_display_actual_peak_luminance: the number of rows
++ * in the targeted_system_display_actual_peak_luminance array
++ * @num_cols_targeted_system_display_actual_peak_luminance: the number of columns in the
++ * targeted_system_display_actual_peak_luminance array
++ * @targeted_system_display_actual_peak_luminance: the normalized actual peak luminance of
++ * the targeted system display
++ * @mastering_display_actual_peak_luminance_flag: shall be equal to 0 for this version of this Standard
++ * @num_rows_mastering_display_actual_peak_luminance: the number of rows in the
++ * mastering_display_actual_peak_luminance array
++ * @num_cols_mastering_display_actual_peak_luminance: the number of columns in the
++ * mastering_display_actual_peak_luminance array.
++ * @mastering_display_actual_peak_luminance: the normalized actual peak luminance of
++ * the mastering display used for mastering the image essence
++ *
++ * Dynamic HDR 10+ metadata defined in SMPTE2094-40
++ * and CTA-861-G Annex S HDR Dynamic Metadata Syntax Type 4.
++ *
++ * Since: 1.20
++ */
++struct _GstVideoHDR10Plus
++{
++  guint8 application_identifier;
++  guint8 application_version;
++  guint8 num_windows;
++  GstVideoColorVolumeTransformation processing_window[GST_VIDEO_HDR10_PLUS_NUM_WINDOWS];
++  guint32 targeted_system_display_maximum_luminance;
++  guint8 targeted_system_display_actual_peak_luminance_flag;
++  guint8 num_rows_targeted_system_display_actual_peak_luminance;
++  guint8 num_cols_targeted_system_display_actual_peak_luminance;
++  guint8 targeted_system_display_actual_peak_luminance[GST_VIDEO_HDR10_PLUS_MAX_ROWS_TSD_APL][GST_VIDEO_HDR10_PLUS_MAX_COLS_MD_APL];
++  guint8 mastering_display_actual_peak_luminance_flag;
++  guint8 num_rows_mastering_display_actual_peak_luminance;
++  guint8 num_cols_mastering_display_actual_peak_luminance;
++  guint8 mastering_display_actual_peak_luminance[GST_VIDEO_HDR10_PLUS_MAX_ROWS_TSD_APL][GST_VIDEO_HDR10_PLUS_MAX_COLS_MD_APL];
++
++  /*< private >*/
++  gpointer _gst_reserved[GST_PADDING];
++};
++
++GST_VIDEO_API gboolean
++gst_video_hdr_parse_hdr10_plus (const guint8 * data, gsize size,
++                                GstVideoHDR10Plus * hdr10_plus);
++
++G_END_DECLS
++
++#endif /* __GST_VIDEO_HDR_H__ */
+diff --git a/gst-libs/gst/video/video.h b/gst-libs/gst/video/video.h
+index c26df59..c6ca091 100644
+--- a/gst-libs/gst/video/video.h
++++ b/gst-libs/gst/video/video.h
+@@ -183,5 +183,6 @@ G_END_DECLS
+ #include <gst/video/gstvideotimecode.h>
+ #include <gst/video/gstvideoaffinetransformationmeta.h>
+ #include <gst/video/video-anc.h>
++#include <gst/video/video-hdr.h>
+ 
+ #endif /* __GST_VIDEO_H__ */
+-- 
+2.7.4
+

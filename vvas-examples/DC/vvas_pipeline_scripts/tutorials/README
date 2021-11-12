@@ -1,0 +1,19 @@
+Setup VVAS environment and XRM environment using below command. This is mandatory before running any script
+# source /opt/xilinx/xcdr/setup.sh
+# source /opt/xilinx/vvas/setup.sh
+
+Running any scripts without argumenets gives the example command on how to run that script
+
+The input video stream files referred in the scripts command examples are not part of this package.
+User can use any input streams of supported type for that specific scripts. Most of the scripts work
+with either of h.264 input stream or MP4 with h.264 stream in it
+
+Running these scripts by default writes output streams into a file.  This affects performance fps numbers.
+To display the frames per second (fps) for some of the scripts that supports fakesink operation,
+give the last argument of scripts as 1
+ 
+Whenever device index error is coming from script, ensure to give valid index based on avaiable no. of cards
+They start from 0 to NUM_TOTAL_DEVICES connected to the host
+
+Timeout exec errors may come if the incorrect arguments are given to scripts. Host machine needs to be cold
+rebooted in such cases and report this issue.
