@@ -1,0 +1,1217 @@
+From a4c697eaa04748ab006f5aaee1f64605571cb3a1 Mon Sep 17 00:00:00 2001
+From: pankajd <pankajd@xilinx.com>
+Date: Tue, 21 Sep 2021 08:59:26 -0600
+Subject: [PATCH] Update Colorimetry and SEI parsing for HDR10
+
+---
+ gst-libs/gst/codecparsers/gsth264parser.c |  69 ++++++++
+ gst-libs/gst/codecparsers/gsth264parser.h |  61 ++++++-
+ gst-libs/gst/codecparsers/gsth265parser.c |  69 ++++++++
+ gst-libs/gst/codecparsers/gsth265parser.h |  59 +++++++
+ gst/videoparsers/gsth264parse.c           | 281 +++++++++++++++++++++++++++---
+ gst/videoparsers/gsth264parse.h           |  10 ++
+ gst/videoparsers/gsth265parse.c           | 269 +++++++++++++++++++++++++++-
+ gst/videoparsers/gsth265parse.h           |  10 ++
+ 8 files changed, 797 insertions(+), 31 deletions(-)
+
+diff --git a/gst-libs/gst/codecparsers/gsth264parser.c b/gst-libs/gst/codecparsers/gsth264parser.c
+index acc6fd9..85e1ed2 100644
+--- a/gst-libs/gst/codecparsers/gsth264parser.c
++++ b/gst-libs/gst/codecparsers/gsth264parser.c
+@@ -1161,6 +1161,62 @@ error:
+ }
+ 
+ static GstH264ParserResult
++gst_h264_parser_parse_mastering_display_colour_volume (GstH264NalParser *
++    parser, GstH264MasteringDisplayColourVolume * mdcv, NalReader * nr)
++{
++  guint i;
++
++  GST_DEBUG ("parsing \"Mastering display colour volume\"");
++
++  for (i = 0; i < 3; i++) {
++    READ_UINT16 (nr, mdcv->display_primaries_x[i], 16);
++    READ_UINT16 (nr, mdcv->display_primaries_y[i], 16);
++  }
++
++  READ_UINT16 (nr, mdcv->white_point_x, 16);
++  READ_UINT16 (nr, mdcv->white_point_y, 16);
++  READ_UINT32 (nr, mdcv->max_display_mastering_luminance, 32);
++  READ_UINT32 (nr, mdcv->min_display_mastering_luminance, 32);
++
++  return GST_H264_PARSER_OK;
++
++error:
++  GST_WARNING ("error parsing \"Mastering display colour volume\"");
++  return GST_H264_PARSER_ERROR;
++}
++
++static GstH264ParserResult
++gst_h264_parser_parse_content_light_level_info (GstH264NalParser * parser,
++    GstH264ContentLightLevel * cll, NalReader * nr)
++{
++  GST_DEBUG ("parsing \"Content light level\"");
++
++  READ_UINT16 (nr, cll->max_content_light_level, 16);
++  READ_UINT16 (nr, cll->max_pic_average_light_level, 16);
++
++  return GST_H264_PARSER_OK;
++
++error:
++  GST_WARNING ("error parsing \"Content light level\"");
++  return GST_H264_PARSER_ERROR;
++}
++
++static GstH264ParserResult
++gst_h264_parser_parse_alternative_transfer_characteristics (GstH264NalParser *
++    parser, GstH264AlternativeTransferCharacteristics * atc, NalReader * nr)
++{
++  GST_DEBUG ("parsing \"Alternative transfer characteristics\"");
++
++  READ_UINT8 (nr, atc->preferred_transfer_characteristics, 8);
++
++  return GST_H264_PARSER_OK;
++
++error:
++  GST_WARNING ("error parsing \"Alternative transfer characteristics\"");
++  return GST_H264_PARSER_ERROR;
++}
++
++static GstH264ParserResult
+ gst_h264_parser_parse_sei_message (GstH264NalParser * nalparser,
+     NalReader * nr, GstH264SEIMessage * sei)
+ {
+@@ -1218,6 +1274,19 @@ gst_h264_parser_parse_sei_message (GstH264NalParser * nalparser,
+       res = gst_h264_parser_parse_frame_packing (nalparser,
+           &sei->payload.frame_packing, nr, payload_size);
+       break;
++    case GST_H264_SEI_MASTERING_DISPLAY_COLOUR_VOLUME:
++      res = gst_h264_parser_parse_mastering_display_colour_volume (nalparser,
++          &sei->payload.mastering_display_colour_volume, nr);
++      break;
++    case GST_H264_SEI_CONTENT_LIGHT_LEVEL:
++      res = gst_h264_parser_parse_content_light_level_info (nalparser,
++          &sei->payload.content_light_level, nr);
++      break;
++    case GST_H264_SEI_ALTERNATIVE_TRANSFER_CHARACTERISTICS:
++      res =
++          gst_h264_parser_parse_alternative_transfer_characteristics (nalparser,
++          &sei->payload.alt_transfer_char, nr);
++      break;
+     default:
+       /* Just consume payloadSize bytes, which does not account for
+          emulation prevention bytes */
+diff --git a/gst-libs/gst/codecparsers/gsth264parser.h b/gst-libs/gst/codecparsers/gsth264parser.h
+index d848404..9be1ff8 100644
+--- a/gst-libs/gst/codecparsers/gsth264parser.h
++++ b/gst-libs/gst/codecparsers/gsth264parser.h
+@@ -245,6 +245,9 @@ typedef enum
+  * @GST_H264_SEI_STEREO_VIDEO_INFO: stereo video info SEI message (Since: 1.6)
+  * @GST_H264_SEI_FRAME_PACKING: Frame Packing Arrangement (FPA) message that
+  *     contains the 3D arrangement for stereoscopic 3D video (Since: 1.6)
++ * @GST_H264_SEI_MASTERING_DISPLAY_COLOUR_VOLUME: Mastering display colour volume information SEI message (D.2.29) (Since: 1.18)
++ * @GST_H264_SEI_CONTENT_LIGHT_LEVEL: Content light level information SEI message (D.2.31) (Since: 1.18)
++ * @GST_H265_SEI_ALTERNATIVE_TRANSFER_CHARACTERISTICS: Preferred Transfer Characteristics SEI message (D.2.32)
+  * ...
+  *
+  * The type of SEI message.
+@@ -256,7 +259,10 @@ typedef enum
+   GST_H264_SEI_REGISTERED_USER_DATA = 4,
+   GST_H264_SEI_RECOVERY_POINT = 6,
+   GST_H264_SEI_STEREO_VIDEO_INFO = 21,
+-  GST_H264_SEI_FRAME_PACKING = 45
++  GST_H264_SEI_FRAME_PACKING = 45,
++  GST_H264_SEI_MASTERING_DISPLAY_COLOUR_VOLUME = 137,
++  GST_H264_SEI_CONTENT_LIGHT_LEVEL = 144,
++  GST_H264_SEI_ALTERNATIVE_TRANSFER_CHARACTERISTICS = 147,
+       /* and more...  */
+ } GstH264SEIPayloadType;
+ 
+@@ -352,6 +358,9 @@ typedef struct _GstH264BufferingPeriod        GstH264BufferingPeriod;
+ typedef struct _GstH264RecoveryPoint          GstH264RecoveryPoint;
+ typedef struct _GstH264StereoVideoInfo        GstH264StereoVideoInfo;
+ typedef struct _GstH264FramePacking           GstH264FramePacking;
++typedef struct _GstH264MasteringDisplayColourVolume GstH264MasteringDisplayColourVolume;
++typedef struct _GstH264ContentLightLevel        GstH264ContentLightLevel;
++typedef struct _GstH264AlternativeTransferCharacteristics GstH264AlternativeTransferCharacteristics;
+ typedef struct _GstH264SEIMessage             GstH264SEIMessage;
+ 
+ /**
+@@ -1026,6 +1035,53 @@ struct _GstH264RecoveryPoint
+   guint8 changing_slice_group_idc;
+ };
+ 
++/**
++ * GstH264MasteringDisplayColourVolume:
++ * The colour volume (primaries, white point and luminance range) of display
++ * defined by SMPTE ST 2086.
++ *
++ * D.2.29
++ *
++ * Since: 1.18
++ */
++struct _GstH264MasteringDisplayColourVolume
++{
++  guint16 display_primaries_x[3];
++  guint16 display_primaries_y[3];
++  guint16 white_point_x;
++  guint16 white_point_y;
++  guint32 max_display_mastering_luminance;
++  guint32 min_display_mastering_luminance;
++};
++
++/**
++ * GstH264ContentLightLevel:
++ * The upper bounds for the nominal target brightness light level
++ * as specified in CEA-861.3
++ *
++ * D.2.31
++ *
++ * Since: 1.18
++ */
++struct _GstH264ContentLightLevel
++{
++  guint16 max_content_light_level;
++  guint16 max_pic_average_light_level;
++};
++
++/**
++ * GstH264AlternativeTransferCharacteristics:
++ * The preferred alternative value for the transfer_characteristics element in
++ * the VUI of the SPS
++ *
++ * D.2.32
++ *
++ */
++struct _GstH264AlternativeTransferCharacteristics
++{
++  guint8 preferred_transfer_characteristics;
++};
++
+ struct _GstH264SEIMessage
+ {
+   GstH264SEIPayloadType payloadType;
+@@ -1037,6 +1093,9 @@ struct _GstH264SEIMessage
+     GstH264RecoveryPoint recovery_point;
+     GstH264StereoVideoInfo stereo_video_info;
+     GstH264FramePacking frame_packing;
++    GstH264MasteringDisplayColourVolume mastering_display_colour_volume;
++    GstH264ContentLightLevel content_light_level;
++    GstH264AlternativeTransferCharacteristics alt_transfer_char;
+     /* ... could implement more */
+   } payload;
+ };
+diff --git a/gst-libs/gst/codecparsers/gsth265parser.c b/gst-libs/gst/codecparsers/gsth265parser.c
+index 16fce00..7ba76c7 100644
+--- a/gst-libs/gst/codecparsers/gsth265parser.c
++++ b/gst-libs/gst/codecparsers/gsth265parser.c
+@@ -1182,6 +1182,62 @@ error:
+   return GST_H265_PARSER_ERROR;
+ }
+ 
++static GstH265ParserResult
++gst_h265_parser_parse_mastering_display_colour_volume (GstH265Parser * parser,
++    GstH265MasteringDisplayColourVolume * mdcv, NalReader * nr)
++{
++  guint i;
++
++  GST_DEBUG ("parsing \"Mastering display colour volume\"");
++
++  for (i = 0; i < 3; i++) {
++    READ_UINT16 (nr, mdcv->display_primaries_x[i], 16);
++    READ_UINT16 (nr, mdcv->display_primaries_y[i], 16);
++  }
++
++  READ_UINT16 (nr, mdcv->white_point_x, 16);
++  READ_UINT16 (nr, mdcv->white_point_y, 16);
++  READ_UINT32 (nr, mdcv->max_display_mastering_luminance, 32);
++  READ_UINT32 (nr, mdcv->min_display_mastering_luminance, 32);
++
++  return GST_H265_PARSER_OK;
++
++error:
++  GST_WARNING ("error parsing \"Mastering display colour volume\"");
++  return GST_H265_PARSER_ERROR;
++}
++
++static GstH265ParserResult
++gst_h265_parser_parse_content_light_level_info (GstH265Parser * parser,
++    GstH265ContentLightLevel * cll, NalReader * nr)
++{
++  GST_DEBUG ("parsing \"Content light level\"");
++
++  READ_UINT16 (nr, cll->max_content_light_level, 16);
++  READ_UINT16 (nr, cll->max_pic_average_light_level, 16);
++
++  return GST_H265_PARSER_OK;
++
++error:
++  GST_WARNING ("error parsing \"Content light level\"");
++  return GST_H265_PARSER_ERROR;
++}
++
++static GstH265ParserResult
++gst_h265_parser_parse_alternative_transfer_characteristics (GstH265Parser *
++    parser, GstH265AlternativeTransferCharacteristics * atc, NalReader * nr)
++{
++  GST_DEBUG ("parsing \"Alternative transfer characteristics\"");
++
++  READ_UINT8 (nr, atc->preferred_transfer_characteristics, 8);
++
++  return GST_H265_PARSER_OK;
++
++error:
++  GST_WARNING ("error parsing \"Alternative transfer characteristics\"");
++  return GST_H265_PARSER_ERROR;
++}
++
+ /******** API *************/
+ 
+ /**
+@@ -2374,6 +2430,19 @@ gst_h265_parser_parse_sei_message (GstH265Parser * parser,
+         res = gst_h265_parser_parse_time_code (parser,
+             &sei->payload.time_code, nr);
+         break;
++      case GST_H265_SEI_MASTERING_DISPLAY_COLOUR_VOLUME:
++        res = gst_h265_parser_parse_mastering_display_colour_volume (parser,
++            &sei->payload.mastering_display_colour_volume, nr);
++        break;
++      case GST_H265_SEI_CONTENT_LIGHT_LEVEL:
++        res = gst_h265_parser_parse_content_light_level_info (parser,
++            &sei->payload.content_light_level, nr);
++        break;
++      case GST_H265_SEI_ALTERNATIVE_TRANSFER_CHARACTERISTICS:
++        res =
++            gst_h265_parser_parse_alternative_transfer_characteristics (parser,
++            &sei->payload.alt_transfer_char, nr);
++        break;
+       default:
+         /* Just consume payloadSize bytes, which does not account for
+            emulation prevention bytes */
+diff --git a/gst-libs/gst/codecparsers/gsth265parser.h b/gst-libs/gst/codecparsers/gsth265parser.h
+index 488405b..3bf12a9 100644
+--- a/gst-libs/gst/codecparsers/gsth265parser.h
++++ b/gst-libs/gst/codecparsers/gsth265parser.h
+@@ -222,6 +222,9 @@ typedef enum
+  * @GST_H265_SEI_PIC_TIMING: Picture Timing SEI Message
+  * @GST_H265_SEI_RECOVERY_POINT: Recovery Point SEI Message (D.3.8)
+  * @GST_H265_SEI_TIME_CODE: Time code SEI message (D.2.27) (Since: 1.16)
++ * @GST_H265_SEI_MASTERING_DISPLAY_COLOUR_VOLUME: Mastering display colour volume information SEI message (D.2.28) (Since: 1.18)
++ * @GST_H265_SEI_CONTENT_LIGHT_LEVEL: Content light level information SEI message (D.2.35) (Since: 1.18)
++ * @GST_H265_SEI_ALTERNATIVE_TRANSFER_CHARACTERISTICS: Preferred Transfer Characteristics SEI message (D.2.38)
+  * ...
+  *
+  * The type of SEI message.
+@@ -232,6 +235,9 @@ typedef enum
+   GST_H265_SEI_PIC_TIMING = 1,
+   GST_H265_SEI_RECOVERY_POINT = 6,
+   GST_H265_SEI_TIME_CODE = 136,
++  GST_H265_SEI_MASTERING_DISPLAY_COLOUR_VOLUME = 137,
++  GST_H265_SEI_CONTENT_LIGHT_LEVEL = 144,
++  GST_H265_SEI_ALTERNATIVE_TRANSFER_CHARACTERISTICS = 147,
+       /* and more...  */
+ } GstH265SEIPayloadType;
+ 
+@@ -319,7 +325,10 @@ typedef struct _GstH265PicTiming                GstH265PicTiming;
+ typedef struct _GstH265BufferingPeriod          GstH265BufferingPeriod;
+ typedef struct _GstH265RecoveryPoint            GstH265RecoveryPoint;
+ typedef struct _GstH265TimeCode                 GstH265TimeCode;
++typedef struct _GstH265MasteringDisplayColourVolume GstH265MasteringDisplayColourVolume;
++typedef struct _GstH265ContentLightLevel        GstH265ContentLightLevel;
+ typedef struct _GstH265SEIMessage               GstH265SEIMessage;
++typedef struct _GstH265AlternativeTransferCharacteristics GstH265AlternativeTransferCharacteristics;
+ 
+ /**
+  * GstH265NalUnit:
+@@ -1106,6 +1115,53 @@ struct _GstH265TimeCode
+   guint32 time_offset_value[3];
+ };
+ 
++/**
++ * GstH265MasteringDisplayColourVolume:
++ * The colour volume (primaries, white point and luminance range) of display
++ * defined by SMPTE ST 2086.
++ *
++ * D.2.28
++ *
++ * Since: 1.18
++ */
++struct _GstH265MasteringDisplayColourVolume
++{
++  guint16 display_primaries_x[3];
++  guint16 display_primaries_y[3];
++  guint16 white_point_x;
++  guint16 white_point_y;
++  guint32 max_display_mastering_luminance;
++  guint32 min_display_mastering_luminance;
++};
++
++/**
++ * GstH265ContentLightLevel:
++ * The upper bounds for the nominal target brightness light level
++ * as specified in CEA-861.3
++ *
++ * D.2.35
++ *
++ * Since: 1.18
++ */
++struct _GstH265ContentLightLevel
++{
++  guint16 max_content_light_level;
++  guint16 max_pic_average_light_level;
++};
++
++/**
++ * GstH265AlternativeTransferCharacteristics:
++ * The preferred alternative value for the transfer_characteristics element in
++ * the VUI of the SPS
++ *
++ * D.2.38
++ *
++ */
++struct _GstH265AlternativeTransferCharacteristics
++{
++  guint8 preferred_transfer_characteristics;
++};
++
+ struct _GstH265SEIMessage
+ {
+   GstH265SEIPayloadType payloadType;
+@@ -1115,6 +1171,9 @@ struct _GstH265SEIMessage
+     GstH265PicTiming pic_timing;
+     GstH265RecoveryPoint recovery_point;
+     GstH265TimeCode time_code;
++    GstH265MasteringDisplayColourVolume mastering_display_colour_volume;
++    GstH265ContentLightLevel content_light_level;
++    GstH265AlternativeTransferCharacteristics alt_transfer_char;
+     /* ... could implement more */
+   } payload;
+ };
+diff --git a/gst/videoparsers/gsth264parse.c b/gst/videoparsers/gsth264parse.c
+index f4d82e5..0931dd0 100644
+--- a/gst/videoparsers/gsth264parse.c
++++ b/gst/videoparsers/gsth264parse.c
+@@ -72,6 +72,13 @@ enum
+       GST_H264_PARSE_STATE_GOT_SLICE)
+ };
+ 
++enum
++{
++  GST_H264_PARSE_SEI_EXPIRED = 0,
++  GST_H264_PARSE_SEI_ACTIVE = 1,
++  GST_H264_PARSE_SEI_PARSED = 2,
++};
++
+ #define GST_H264_PARSE_STATE_VALID(parse, expected_state) \
+   (((parse)->state & (expected_state)) == (expected_state))
+ 
+@@ -214,6 +221,11 @@ gst_h264_parse_reset_stream_info (GstH264Parse * h264parse)
+   h264parse->upstream_par_d = -1;
+   h264parse->parsed_par_n = 0;
+   h264parse->parsed_par_d = 0;
++  h264parse->parsed_colorimetry.range = GST_VIDEO_COLOR_RANGE_UNKNOWN;
++  h264parse->parsed_colorimetry.matrix = GST_VIDEO_COLOR_MATRIX_UNKNOWN;
++  h264parse->parsed_colorimetry.transfer = GST_VIDEO_TRANSFER_UNKNOWN;
++  h264parse->parsed_colorimetry.primaries = GST_VIDEO_COLOR_PRIMARIES_UNKNOWN;
++  
+   h264parse->have_pps = FALSE;
+   h264parse->have_sps = FALSE;
+ 
+@@ -238,6 +250,14 @@ gst_h264_parse_reset_stream_info (GstH264Parse * h264parse)
+     gst_buffer_replace (&h264parse->sps_nals[i], NULL);
+   for (i = 0; i < GST_H264_MAX_PPS_COUNT; i++)
+     gst_buffer_replace (&h264parse->pps_nals[i], NULL);
++
++  gst_video_mastering_display_info_init (&h264parse->mastering_display_info);
++  h264parse->mastering_display_info_state = GST_H264_PARSE_SEI_EXPIRED;
++
++  gst_video_content_light_level_init (&h264parse->content_light_level);
++  h264parse->content_light_level_state = GST_H264_PARSE_SEI_EXPIRED;
++
++  h264parse->alt_transfer_char_state = GST_H264_PARSE_SEI_EXPIRED;
+ }
+ 
+ static void
+@@ -642,8 +662,8 @@ gst_h264_parse_process_sei (GstH264Parse * h264parse, GstH264NalUnit * nalu)
+ 
+         for (j = 0; j < 3; j++) {
+           if (sei.payload.pic_timing.clock_timestamp_flag[j]) {
+-            memcpy (&h264parse->clock_timestamp[h264parse->
+-                    num_clock_timestamp++],
++            memcpy (&h264parse->
++                clock_timestamp[h264parse->num_clock_timestamp++],
+                 &sei.payload.pic_timing.clock_timestamp[j],
+                 sizeof (GstH264ClockTimestamp));
+           }
+@@ -806,6 +826,116 @@ gst_h264_parse_process_sei (GstH264Parse * h264parse, GstH264NalUnit * nalu)
+         }
+         break;
+       }
++      case GST_H264_SEI_MASTERING_DISPLAY_COLOUR_VOLUME:
++      {
++        /* Precision defined by spec.
++         * See D.2.29 Mastering display colour volume SEI message semantics */
++        GstVideoMasteringDisplayInfo minfo;
++        gint j, k;
++
++        /* GstVideoMasteringDisplayInfo::display_primaries is rgb order but
++         * AVC uses gbr order.
++         * See spec D.2.29 display_primaries_x and display_primaries_y
++         */
++        for (j = 0, k = 2; j < G_N_ELEMENTS (minfo.display_primaries); j++, k++) {
++          minfo.display_primaries[j].x =
++              sei.payload.
++              mastering_display_colour_volume.display_primaries_x[k % 3];
++          minfo.display_primaries[j].y =
++              sei.payload.
++              mastering_display_colour_volume.display_primaries_y[k % 3];
++        }
++
++        minfo.white_point.x =
++            sei.payload.mastering_display_colour_volume.white_point_x;
++        minfo.white_point.y =
++            sei.payload.mastering_display_colour_volume.white_point_y;
++        minfo.max_display_mastering_luminance =
++            sei.payload.mastering_display_colour_volume.
++            max_display_mastering_luminance;
++        minfo.min_display_mastering_luminance =
++            sei.payload.mastering_display_colour_volume.
++            min_display_mastering_luminance;
++
++        GST_LOG_OBJECT (h264parse, "mastering display info found: "
++            "Red(%u, %u) "
++            "Green(%u, %u) "
++            "Blue(%u, %u) "
++            "White(%u, %u) "
++            "max_luminance(%u) "
++            "min_luminance(%u) ",
++            minfo.display_primaries[0].x, minfo.display_primaries[0].y,
++            minfo.display_primaries[1].x, minfo.display_primaries[1].y,
++            minfo.display_primaries[2].x, minfo.display_primaries[2].y,
++            minfo.white_point.x, minfo.white_point.y,
++            minfo.max_display_mastering_luminance,
++            minfo.min_display_mastering_luminance);
++
++        if (h264parse->mastering_display_info_state ==
++            GST_H264_PARSE_SEI_EXPIRED) {
++          h264parse->update_caps = TRUE;
++        } else if (!gst_video_mastering_display_info_is_equal
++            (&h264parse->mastering_display_info, &minfo)) {
++          h264parse->update_caps = TRUE;
++        }
++
++        h264parse->mastering_display_info_state = GST_H264_PARSE_SEI_PARSED;
++        h264parse->mastering_display_info = minfo;
++
++        break;
++      }
++      case GST_H264_SEI_CONTENT_LIGHT_LEVEL:
++      {
++        GstVideoContentLightLevel cll;
++
++        cll.max_content_light_level =
++            sei.payload.content_light_level.max_content_light_level;
++        cll.max_frame_average_light_level =
++            sei.payload.content_light_level.max_pic_average_light_level;
++
++        GST_LOG_OBJECT (h264parse, "content light level found: "
++            "maxCLL:(%u), maxFALL:(%u)", cll.max_content_light_level,
++            cll.max_frame_average_light_level);
++
++        if (h264parse->content_light_level_state == GST_H264_PARSE_SEI_EXPIRED) {
++          h264parse->update_caps = TRUE;
++        } else if (cll.max_content_light_level !=
++            h264parse->content_light_level.max_content_light_level ||
++            cll.max_frame_average_light_level !=
++            h264parse->content_light_level.max_frame_average_light_level) {
++          h264parse->update_caps = TRUE;
++        }
++
++        h264parse->content_light_level_state = GST_H264_PARSE_SEI_PARSED;
++        h264parse->content_light_level = cll;
++
++        break;
++      }
++      case GST_H264_SEI_ALTERNATIVE_TRANSFER_CHARACTERISTICS:
++      {
++        guint8 ptc;
++
++        ptc = sei.payload.alt_transfer_char.preferred_transfer_characteristics;
++
++        GST_LOG_OBJECT (h264parse,
++            "alternative transfer characteristics found: "
++            "preferred transfer characteristic:(%u)", ptc);
++
++        if (h264parse->alt_transfer_char_state == GST_H264_PARSE_SEI_EXPIRED) {
++          h264parse->update_caps = TRUE;
++        } else if (ptc != h264parse->preferred_transfer_char) {
++          h264parse->update_caps = TRUE;
++        }
++
++        h264parse->alt_transfer_char_state = GST_H264_PARSE_SEI_PARSED;
++        h264parse->preferred_transfer_char = ptc;
++
++        break;
++      }
++      default:
++        GST_LOG_OBJECT (h264parse, "Unsupported payload type %u",
++            sei.payloadType);
++        break;
+     }
+   }
+   g_array_free (messages, TRUE);
+@@ -820,6 +950,7 @@ gst_h264_parse_process_nal (GstH264Parse * h264parse, GstH264NalUnit * nalu)
+   GstH264SPS sps = { 0, };
+   GstH264NalParser *nalparser = h264parse->nalparser;
+   GstH264ParserResult pres;
++  GstH264SliceHdr slice;
+ 
+   /* nothing to do for broken input */
+   if (G_UNLIKELY (nalu->size < 2)) {
+@@ -945,25 +1076,24 @@ gst_h264_parse_process_nal (GstH264Parse * h264parse, GstH264NalUnit * nalu)
+       GST_DEBUG_OBJECT (h264parse, "frame start: %i", h264parse->frame_start);
+       if (nal_type == GST_H264_NAL_SLICE_EXT && !GST_H264_IS_MVC_NALU (nalu))
+         break;
+-      {
+-        GstH264SliceHdr slice;
+ 
+-        pres = gst_h264_parser_parse_slice_hdr (nalparser, nalu, &slice,
+-            FALSE, FALSE);
+-        GST_DEBUG_OBJECT (h264parse,
+-            "parse result %d, first MB: %u, slice type: %u",
+-            pres, slice.first_mb_in_slice, slice.type);
+-        if (pres == GST_H264_PARSER_OK) {
+-          if (GST_H264_IS_I_SLICE (&slice) || GST_H264_IS_SI_SLICE (&slice))
+-            h264parse->keyframe |= TRUE;
+-
+-          h264parse->state |= GST_H264_PARSE_STATE_GOT_SLICE;
+-          h264parse->field_pic_flag = slice.field_pic_flag;
+-        }
++      pres = gst_h264_parser_parse_slice_hdr (nalparser, nalu, &slice,
++          FALSE, FALSE);
++      GST_DEBUG_OBJECT (h264parse,
++          "parse result %d, first MB: %u, slice type: %u",
++          pres, slice.first_mb_in_slice, slice.type);
++      if (pres == GST_H264_PARSER_OK) {
++        if (GST_H264_IS_I_SLICE (&slice) || GST_H264_IS_SI_SLICE (&slice))
++          h264parse->keyframe |= TRUE;
++
++        h264parse->state |= GST_H264_PARSE_STATE_GOT_SLICE;
++        h264parse->field_pic_flag = slice.field_pic_flag;
+       }
++
+       if (G_LIKELY (nal_type != GST_H264_NAL_SLICE_IDR &&
+               !h264parse->push_codec))
+         break;
++
+       /* if we need to sneak codec NALs into the stream,
+        * this is a good place, so fake it as IDR
+        * (which should be at start anyway) */
+@@ -983,6 +1113,28 @@ gst_h264_parse_process_nal (GstH264Parse * h264parse, GstH264NalUnit * nalu)
+         GST_DEBUG_OBJECT (h264parse, "moved IDR mark to SEI position %d",
+             h264parse->idr_pos);
+       }
++      
++      /* Reset state only on first IDR slice of CVS D.2.29 */
++      if (slice.first_mb_in_slice == 0) {
++        if (h264parse->mastering_display_info_state ==
++            GST_H264_PARSE_SEI_PARSED)
++          h264parse->mastering_display_info_state = GST_H264_PARSE_SEI_ACTIVE;
++        else if (h264parse->mastering_display_info_state ==
++            GST_H264_PARSE_SEI_ACTIVE)
++          h264parse->mastering_display_info_state = GST_H264_PARSE_SEI_EXPIRED;
++
++        if (h264parse->content_light_level_state == GST_H264_PARSE_SEI_PARSED)
++          h264parse->content_light_level_state = GST_H264_PARSE_SEI_ACTIVE;
++        else if (h264parse->content_light_level_state ==
++            GST_H264_PARSE_SEI_ACTIVE)
++          h264parse->content_light_level_state = GST_H264_PARSE_SEI_EXPIRED;
++
++        if (h264parse->alt_transfer_char_state == GST_H264_PARSE_SEI_PARSED)
++          h264parse->alt_transfer_char_state = GST_H264_PARSE_SEI_ACTIVE;
++        else if (h264parse->alt_transfer_char_state ==
++            GST_H264_PARSE_SEI_ACTIVE)
++          h264parse->alt_transfer_char_state = GST_H264_PARSE_SEI_EXPIRED;
++      }
+       break;
+     case GST_H264_NAL_AU_DELIMITER:
+       /* Just accumulate AU Delimiter, whether it's before SPS or not */
+@@ -1900,6 +2052,8 @@ gst_h264_parse_update_src_caps (GstH264Parse * h264parse, GstCaps * caps)
+     gint crop_width, crop_height;
+     gint fps_num, fps_den;
+     gint par_n, par_d;
++    GstH264VUIParams *vui = &sps->vui_parameters;
++    gchar *colorimetry = NULL;
+ 
+     if (sps->frame_cropping_flag) {
+       crop_width = sps->crop_rect_width;
+@@ -1930,16 +2084,46 @@ gst_h264_parse_update_src_caps (GstH264Parse * h264parse, GstCaps * caps)
+       modified = TRUE;
+     }
+ 
+-    if (sps->vui_parameters.aspect_ratio_info_present_flag) {
+-      if (G_UNLIKELY ((h264parse->parsed_par_n != sps->vui_parameters.par_n)
+-              || (h264parse->parsed_par_d != sps->vui_parameters.par_d))) {
+-        h264parse->parsed_par_n = sps->vui_parameters.par_n;
+-        h264parse->parsed_par_d = sps->vui_parameters.par_d;
++    if (vui->aspect_ratio_info_present_flag) {
++      if (G_UNLIKELY ((h264parse->parsed_par_n != vui->par_n)
++              || (h264parse->parsed_par_d != vui->par_d))) {
++        h264parse->parsed_par_n = vui->par_n;
++        h264parse->parsed_par_d = vui->par_d;
+         GST_INFO_OBJECT (h264parse, "pixel aspect ratio has been changed %d/%d",
+             h264parse->parsed_par_n, h264parse->parsed_par_d);
+       }
+     }
+ 
++    if (vui->video_signal_type_present_flag &&
++        vui->colour_description_present_flag) {
++      GstVideoColorimetry ci = { 0, };
++      gchar *old_colorimetry = NULL;
++
++      if (vui->video_full_range_flag)
++        ci.range = GST_VIDEO_COLOR_RANGE_0_255;
++      else
++        ci.range = GST_VIDEO_COLOR_RANGE_16_235;
++
++      ci.matrix = gst_video_color_matrix_from_iso (vui->matrix_coefficients);
++      ci.transfer =
++          gst_video_color_transfer_from_iso (vui->transfer_characteristics);
++      ci.primaries = gst_video_color_primaries_from_iso (vui->colour_primaries);
++
++      old_colorimetry =
++          gst_video_colorimetry_to_string (&h264parse->parsed_colorimetry);
++      colorimetry = gst_video_colorimetry_to_string (&ci);
++
++      if (colorimetry && g_strcmp0 (old_colorimetry, colorimetry)) {
++        GST_INFO_OBJECT (h264parse,
++            "colorimetry has been changed from %s to %s",
++            GST_STR_NULL (old_colorimetry), colorimetry);
++        h264parse->parsed_colorimetry = ci;
++        modified = TRUE;
++      }
++
++      g_free (old_colorimetry);
++    }
++
+     if (G_UNLIKELY (modified || h264parse->update_caps)) {
+       GstVideoInterlaceMode imode = GST_VIDEO_INTERLACE_MODE_PROGRESSIVE;
+       gint width, height;
+@@ -2056,10 +2240,39 @@ gst_h264_parse_update_src_caps (GstH264Parse * h264parse, GstCaps * caps)
+             "chroma-format", G_TYPE_STRING, chroma_format,
+             "bit-depth-luma", G_TYPE_UINT, sps->bit_depth_luma_minus8 + 8,
+             "bit-depth-chroma", G_TYPE_UINT, bit_depth_chroma, NULL);
++
++      if (colorimetry && (!s || !gst_structure_has_field (s, "colorimetry"))) {
++        if (h264parse->alt_transfer_char_state != GST_H264_PARSE_SEI_EXPIRED) {
++          GstVideoColorimetry ci = { 0, };
++          gboolean ret;
++
++          ret = gst_video_colorimetry_from_string (&ci, colorimetry);
++          if (ret
++              && ci.transfer !=
++              gst_video_color_transfer_from_iso
++              (h264parse->preferred_transfer_char)) {
++            ci.transfer =
++                gst_video_color_transfer_from_iso
++                (h264parse->preferred_transfer_char);
++
++            g_free (colorimetry);
++            colorimetry = gst_video_colorimetry_to_string (&ci);
++            GST_DEBUG_OBJECT (h264parse,
++                "Forcing colorimetry to %s due to ATC SEI", colorimetry);
++          }
++        }
++        gst_caps_set_simple (caps, "colorimetry", G_TYPE_STRING, colorimetry,
++            NULL);
++      }
+     }
++
++    g_free (colorimetry);
+   }
+ 
+   if (caps) {
++    const gchar *mdi_str = NULL;
++    const gchar *cll_str = NULL;
++
+     gst_caps_set_simple (caps, "parsed", G_TYPE_BOOLEAN, TRUE,
+         "stream-format", G_TYPE_STRING,
+         gst_h264_parse_get_string (h264parse, TRUE, h264parse->format),
+@@ -2082,6 +2295,32 @@ gst_h264_parse_update_src_caps (GstH264Parse * h264parse, GstCaps * caps)
+       ensure_caps_profile (h264parse, caps, sps);
+     }
+ 
++    if (s)
++      mdi_str = gst_structure_get_string (s, "mastering-display-info");
++    if (mdi_str) {
++      gst_caps_set_simple (caps, "mastering-display-info", G_TYPE_STRING,
++          mdi_str, NULL);
++    } else if (h264parse->mastering_display_info_state !=
++        GST_H264_PARSE_SEI_EXPIRED &&
++        !gst_video_mastering_display_info_add_to_caps
++        (&h264parse->mastering_display_info, caps)) {
++      GST_WARNING_OBJECT (h264parse,
++          "Couldn't set mastering display info to caps");
++    }
++
++    if (s)
++      cll_str = gst_structure_get_string (s, "content-light-level");
++    if (cll_str) {
++      gst_caps_set_simple (caps, "content-light-level", G_TYPE_STRING, cll_str,
++          NULL);
++    } else if (h264parse->content_light_level_state !=
++        GST_H264_PARSE_SEI_EXPIRED &&
++        !gst_video_content_light_level_add_to_caps
++        (&h264parse->content_light_level, caps)) {
++      GST_WARNING_OBJECT (h264parse,
++          "Couldn't set content light level to caps");
++    }
++
+     src_caps = gst_pad_get_current_caps (GST_BASE_PARSE_SRC_PAD (h264parse));
+ 
+     if (src_caps) {
+diff --git a/gst/videoparsers/gsth264parse.h b/gst/videoparsers/gsth264parse.h
+index a8e0120..3668bc7 100644
+--- a/gst/videoparsers/gsth264parse.h
++++ b/gst/videoparsers/gsth264parse.h
+@@ -60,6 +60,7 @@ struct _GstH264Parse
+   gint upstream_par_n, upstream_par_d;
+   gint parsed_par_n, parsed_par_d;
+   gint parsed_fps_n, parsed_fps_d;
++  GstVideoColorimetry parsed_colorimetry;
+   /* current codec_data in output caps, if any */
+   GstBuffer *codec_data;
+   /* input codec_data, if any */
+@@ -146,6 +147,15 @@ struct _GstH264Parse
+   guint8 closedcaptions[96];
+   guint closedcaptions_size;
+   GstVideoCaptionType closedcaptions_type;
++
++  GstVideoMasteringDisplayInfo mastering_display_info;
++  guint mastering_display_info_state;
++
++  GstVideoContentLightLevel content_light_level;
++  guint content_light_level_state;
++
++  guint8 preferred_transfer_char;
++  guint alt_transfer_char_state;
+ };
+ 
+ struct _GstH264ParseClass
+diff --git a/gst/videoparsers/gsth265parse.c b/gst/videoparsers/gsth265parse.c
+index 5031ba6..f2636b4 100644
+--- a/gst/videoparsers/gsth265parse.c
++++ b/gst/videoparsers/gsth265parse.c
+@@ -24,7 +24,6 @@
+ 
+ #include <gst/base/base.h>
+ #include <gst/pbutils/pbutils.h>
+-#include <gst/video/video.h>
+ #include "gsth265parse.h"
+ 
+ #include <string.h>
+@@ -68,6 +67,13 @@ enum
+       GST_H265_PARSE_STATE_GOT_SLICE)
+ };
+ 
++enum
++{
++  GST_H265_PARSE_SEI_EXPIRED = 0,
++  GST_H265_PARSE_SEI_ACTIVE = 1,
++  GST_H265_PARSE_SEI_PARSED = 2,
++};
++
+ #define GST_H265_PARSE_STATE_VALID(parse, expected_state) \
+   (((parse)->state & (expected_state)) == (expected_state))
+ 
+@@ -203,6 +209,10 @@ gst_h265_parse_reset_stream_info (GstH265Parse * h265parse)
+   h265parse->upstream_par_d = -1;
+   h265parse->parsed_par_n = 0;
+   h265parse->parsed_par_n = 0;
++  h265parse->parsed_colorimetry.range = GST_VIDEO_COLOR_RANGE_UNKNOWN;
++  h265parse->parsed_colorimetry.matrix = GST_VIDEO_COLOR_MATRIX_UNKNOWN;
++  h265parse->parsed_colorimetry.transfer = GST_VIDEO_TRANSFER_UNKNOWN;
++  h265parse->parsed_colorimetry.primaries = GST_VIDEO_COLOR_PRIMARIES_UNKNOWN;
+   h265parse->have_pps = FALSE;
+   h265parse->have_sps = FALSE;
+   h265parse->have_vps = FALSE;
+@@ -226,6 +236,14 @@ gst_h265_parse_reset_stream_info (GstH265Parse * h265parse)
+     gst_buffer_replace (&h265parse->sps_nals[i], NULL);
+   for (i = 0; i < GST_H265_MAX_PPS_COUNT; i++)
+     gst_buffer_replace (&h265parse->pps_nals[i], NULL);
++
++  gst_video_mastering_display_info_init (&h265parse->mastering_display_info);
++  h265parse->mastering_display_info_state = GST_H265_PARSE_SEI_EXPIRED;
++
++  gst_video_content_light_level_init (&h265parse->content_light_level);
++  h265parse->content_light_level_state = GST_H265_PARSE_SEI_EXPIRED;
++
++  h265parse->alt_transfer_char_state = GST_H265_PARSE_SEI_EXPIRED;
+ }
+ 
+ static void
+@@ -554,6 +572,114 @@ gst_h265_parse_process_sei (GstH265Parse * h265parse, GstH265NalUnit * nalu)
+       case GST_H265_SEI_BUF_PERIOD:
+         /* FIXME */
+         break;
++      case GST_H265_SEI_MASTERING_DISPLAY_COLOUR_VOLUME:
++      {
++        /* Precision defined by spec.
++         * See D.3.28 Mastering display colour volume SEI message semantics */
++        GstVideoMasteringDisplayInfo minfo;
++        gint j, k;
++
++        /* GstVideoMasteringDisplayInfo::display_primaries is rgb order but
++         * HEVC uses gbr order
++         * See spec D.3.28 display_primaries_x and display_primaries_y
++         */
++        for (j = 0, k = 2; j < G_N_ELEMENTS (minfo.display_primaries); j++, k++) {
++          minfo.display_primaries[j].x =
++              sei.payload.
++              mastering_display_colour_volume.display_primaries_x[k % 3];
++          minfo.display_primaries[j].y =
++              sei.payload.
++              mastering_display_colour_volume.display_primaries_y[k % 3];
++        }
++
++        minfo.white_point.x =
++            sei.payload.mastering_display_colour_volume.white_point_x;
++        minfo.white_point.y =
++            sei.payload.mastering_display_colour_volume.white_point_y;
++        minfo.max_display_mastering_luminance =
++            sei.payload.mastering_display_colour_volume.
++            max_display_mastering_luminance;
++        minfo.min_display_mastering_luminance =
++            sei.payload.mastering_display_colour_volume.
++            min_display_mastering_luminance;
++
++        GST_LOG_OBJECT (h265parse, "mastering display info found: "
++            "Red(%u, %u) "
++            "Green(%u, %u) "
++            "Blue(%u, %u) "
++            "White(%u, %u) "
++            "max_luminance(%u) "
++            "min_luminance(%u) ",
++            minfo.display_primaries[0].x, minfo.display_primaries[0].y,
++            minfo.display_primaries[1].x, minfo.display_primaries[1].y,
++            minfo.display_primaries[2].x, minfo.display_primaries[2].y,
++            minfo.white_point.x, minfo.white_point.y,
++            minfo.max_display_mastering_luminance,
++            minfo.min_display_mastering_luminance);
++
++        if (h265parse->mastering_display_info_state ==
++            GST_H265_PARSE_SEI_EXPIRED) {
++          h265parse->update_caps = TRUE;
++        } else if (!gst_video_mastering_display_info_is_equal
++            (&h265parse->mastering_display_info, &minfo)) {
++          h265parse->update_caps = TRUE;
++        }
++
++        h265parse->mastering_display_info_state = GST_H265_PARSE_SEI_PARSED;
++        h265parse->mastering_display_info = minfo;
++
++        break;
++      }
++      case GST_H265_SEI_CONTENT_LIGHT_LEVEL:
++      {
++        GstVideoContentLightLevel cll;
++
++        cll.max_content_light_level =
++            sei.payload.content_light_level.max_content_light_level;
++        cll.max_frame_average_light_level =
++            sei.payload.content_light_level.max_pic_average_light_level;
++
++        GST_LOG_OBJECT (h265parse, "content light level found: "
++            "maxCLL:(%u), maxFALL:(%u)", cll.max_content_light_level,
++            cll.max_frame_average_light_level);
++
++        if (h265parse->content_light_level_state == GST_H265_PARSE_SEI_EXPIRED) {
++          h265parse->update_caps = TRUE;
++        } else if (cll.max_content_light_level !=
++            h265parse->content_light_level.max_content_light_level ||
++            cll.max_frame_average_light_level !=
++            h265parse->content_light_level.max_frame_average_light_level) {
++          h265parse->update_caps = TRUE;
++        }
++
++        h265parse->content_light_level_state = GST_H265_PARSE_SEI_PARSED;
++        h265parse->content_light_level = cll;
++
++        break;
++      }
++      case GST_H265_SEI_ALTERNATIVE_TRANSFER_CHARACTERISTICS:
++      {
++        guint8 ptc;
++
++        ptc = sei.payload.alt_transfer_char.preferred_transfer_characteristics;
++
++        GST_LOG_OBJECT (h265parse,
++            "alternative transfer characteristics found: "
++            "preferred transfer characteristic:(%u)", ptc);
++
++        if (h265parse->alt_transfer_char_state == GST_H265_PARSE_SEI_EXPIRED) {
++          h265parse->update_caps = TRUE;
++        } else if (ptc != h265parse->preferred_transfer_char) {
++          h265parse->update_caps = TRUE;
++        }
++
++        h265parse->alt_transfer_char_state = GST_H265_PARSE_SEI_PARSED;
++        h265parse->preferred_transfer_char = ptc;
++
++        break;
++      }
++      default:
++        break;
+     }
+   }
+   g_array_free (messages, TRUE);
+@@ -566,7 +692,6 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
+   GstH265PPS pps = { 0, };
+   GstH265SPS sps = { 0, };
+   GstH265VPS vps = { 0, };
+-  gboolean is_irap;
+   guint nal_type;
+   GstH265Parser *nalparser = h265parse->nalparser;
+   GstH265ParserResult pres = GST_H265_PARSER_ERROR;
+@@ -720,6 +845,8 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
+     case GST_H265_NAL_SLICE_CRA_NUT:
+     {
+       GstH265SliceHdr slice;
++      gboolean is_irap;
++      gboolean no_rasl_output_flag = FALSE;
+ 
+       /* expected state: got-sps|got-pps (valid picture headers) */
+       h265parse->state &= GST_H265_PARSE_STATE_VALID_PICTURE_HEADERS;
+@@ -744,10 +871,47 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
+           pres, slice.first_slice_segment_in_pic_flag, slice.type);
+ 
+       gst_h265_slice_hdr_free (&slice);
+-    }
++
++      /* FIXME: NoRaslOutputFlag can be equal to 1 for CRA if
++       * 1) the first AU in bitstream is CRA
++       * 2) or the first AU following EOS nal is CRA
++       * 3) or it has HandleCraAsBlaFlag equal to 1 */
++      if (nal_type == GST_H265_NAL_SLICE_IDR_W_RADL ||
++          nal_type == GST_H265_NAL_SLICE_IDR_N_LP) {
++        /* NoRaslOutputFlag is equal to 1 for each IDR */
++        no_rasl_output_flag = TRUE;
++      } else if (nal_type == GST_H265_NAL_SLICE_BLA_W_LP ||
++          nal_type == GST_H265_NAL_SLICE_BLA_W_RADL ||
++          nal_type == GST_H265_NAL_SLICE_BLA_N_LP) {
++        /* NoRaslOutputFlag is equal to 1 for each BLA */
++        no_rasl_output_flag = TRUE;
++      }
+ 
+       is_irap = ((nal_type >= GST_H265_NAL_SLICE_BLA_W_LP)
+           && (nal_type <= GST_H265_NAL_SLICE_CRA_NUT)) ? TRUE : FALSE;
++
++      if (no_rasl_output_flag && is_irap
++          && slice.first_slice_segment_in_pic_flag == 1) {
++        if (h265parse->mastering_display_info_state ==
++            GST_H265_PARSE_SEI_PARSED)
++          h265parse->mastering_display_info_state = GST_H265_PARSE_SEI_ACTIVE;
++        else if (h265parse->mastering_display_info_state ==
++            GST_H265_PARSE_SEI_ACTIVE)
++          h265parse->mastering_display_info_state = GST_H265_PARSE_SEI_EXPIRED;
++
++        if (h265parse->content_light_level_state == GST_H265_PARSE_SEI_PARSED)
++          h265parse->content_light_level_state = GST_H265_PARSE_SEI_ACTIVE;
++        else if (h265parse->content_light_level_state ==
++            GST_H265_PARSE_SEI_ACTIVE)
++          h265parse->content_light_level_state = GST_H265_PARSE_SEI_EXPIRED;
++
++        if (h265parse->alt_transfer_char_state == GST_H265_PARSE_SEI_PARSED)
++          h265parse->alt_transfer_char_state = GST_H265_PARSE_SEI_ACTIVE;
++        else if (h265parse->alt_transfer_char_state ==
++            GST_H265_PARSE_SEI_ACTIVE)
++          h265parse->alt_transfer_char_state = GST_H265_PARSE_SEI_EXPIRED;
++      }
++
+       if (G_LIKELY (!is_irap && !h265parse->push_codec))
+         break;
+ 
+@@ -771,6 +935,7 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
+             h265parse->idr_pos);
+       }
+       break;
++    }
+     case GST_H265_NAL_AUD:
+       /* Just accumulate AU Delimiter, whether it's before SPS or not */
+       pres = gst_h265_parser_parse_nal (nalparser, nalu);
+@@ -1635,6 +1800,8 @@ gst_h265_parse_update_src_caps (GstH265Parse * h265parse, GstCaps * caps)
+     gint crop_width, crop_height;
+     const gchar *chroma_format = NULL;
+     guint bit_depth_chroma;
++    GstH265VUIParams *vui = &sps->vui_params;
++    gchar *colorimetry = NULL;
+ 
+     if (sps->conformance_window_flag) {
+       crop_width = sps->crop_rect_width;
+@@ -1666,11 +1833,11 @@ gst_h265_parse_update_src_caps (GstH265Parse * h265parse, GstCaps * caps)
+       }
+     }
+ 
+-    if (sps->vui_params.aspect_ratio_info_present_flag) {
+-      if (G_UNLIKELY ((h265parse->parsed_par_n != sps->vui_params.par_n)
+-              && (h265parse->parsed_par_d != sps->vui_params.par_d))) {
+-        h265parse->parsed_par_n = sps->vui_params.par_n;
+-        h265parse->parsed_par_d = sps->vui_params.par_d;
++    if (vui->aspect_ratio_info_present_flag) {
++      if (G_UNLIKELY ((h265parse->parsed_par_n != vui->par_n)
++              && (h265parse->parsed_par_d != vui->par_d))) {
++        h265parse->parsed_par_n = vui->par_n;
++        h265parse->parsed_par_d = vui->par_d;
+         GST_INFO_OBJECT (h265parse, "pixel aspect ratio has been changed %d/%d",
+             h265parse->parsed_par_n, h265parse->parsed_par_d);
+         modified = TRUE;
+@@ -1678,6 +1845,36 @@ gst_h265_parse_update_src_caps (GstH265Parse * h265parse, GstCaps * caps)
+ 
+     }
+ 
++    if (vui->video_signal_type_present_flag &&
++        vui->colour_description_present_flag) {
++      GstVideoColorimetry ci = { 0, };
++      gchar *old_colorimetry = NULL;
++
++      if (vui->video_full_range_flag)
++        ci.range = GST_VIDEO_COLOR_RANGE_0_255;
++      else
++        ci.range = GST_VIDEO_COLOR_RANGE_16_235;
++
++      ci.matrix = gst_video_color_matrix_from_iso (vui->matrix_coefficients);
++      ci.transfer =
++          gst_video_color_transfer_from_iso (vui->transfer_characteristics);
++      ci.primaries = gst_video_color_primaries_from_iso (vui->colour_primaries);
++
++      old_colorimetry =
++          gst_video_colorimetry_to_string (&h265parse->parsed_colorimetry);
++      colorimetry = gst_video_colorimetry_to_string (&ci);
++
++      if (colorimetry && g_strcmp0 (old_colorimetry, colorimetry)) {
++        GST_INFO_OBJECT (h265parse,
++            "colorimetry has been changed from %s to %s",
++            GST_STR_NULL (old_colorimetry), colorimetry);
++        h265parse->parsed_colorimetry = ci;
++        modified = TRUE;
++      }
++
++      g_free (old_colorimetry);
++    }
++
+     if (G_UNLIKELY (modified || h265parse->update_caps)) {
+       gint fps_num = h265parse->fps_num;
+       gint fps_den = h265parse->fps_den;
+@@ -1745,12 +1942,40 @@ gst_h265_parse_update_src_caps (GstH265Parse * h265parse, GstCaps * caps)
+             chroma_format, "bit-depth-luma", G_TYPE_UINT,
+             sps->bit_depth_luma_minus8 + 8, "bit-depth-chroma", G_TYPE_UINT,
+             bit_depth_chroma, NULL);
++
++      if (colorimetry && (!s || !gst_structure_has_field (s, "colorimetry"))) {
++        if (h265parse->alt_transfer_char_state != GST_H265_PARSE_SEI_EXPIRED) {
++          GstVideoColorimetry ci = { 0, };
++          gboolean ret;
++
++          ret = gst_video_colorimetry_from_string (&ci, colorimetry);
++          if (ret
++              && ci.transfer !=
++              gst_video_color_transfer_from_iso
++              (h265parse->preferred_transfer_char)) {
++            ci.transfer =
++                gst_video_color_transfer_from_iso
++                (h265parse->preferred_transfer_char);
++
++            g_free (colorimetry);
++            colorimetry = gst_video_colorimetry_to_string (&ci);
++            GST_DEBUG_OBJECT (h265parse,
++                "Forcing colorimetry to %s due to ATC SEI", colorimetry);
++          }
++        }
++        gst_caps_set_simple (caps, "colorimetry", G_TYPE_STRING, colorimetry,
++            NULL);
++      }
+     }
++
++    g_free (colorimetry);
+   }
+ 
+   if (caps) {
+     gint par_n, par_d;
+-
++    const gchar *mdi_str = NULL;
++    const gchar *cll_str = NULL;
++    
+     gst_caps_set_simple (caps, "parsed", G_TYPE_BOOLEAN, TRUE,
+         "stream-format", G_TYPE_STRING,
+         gst_h265_parse_get_string (h265parse, TRUE, h265parse->format),
+@@ -1787,6 +2012,32 @@ gst_h265_parse_update_src_caps (GstH265Parse * h265parse, GstCaps * caps)
+       ensure_caps_profile (h265parse, caps, sps);
+     }
+ 
++    if (s)
++      mdi_str = gst_structure_get_string (s, "mastering-display-info");
++    if (mdi_str) {
++      gst_caps_set_simple (caps, "mastering-display-info", G_TYPE_STRING,
++          mdi_str, NULL);
++    } else if (h265parse->mastering_display_info_state !=
++        GST_H265_PARSE_SEI_EXPIRED &&
++        !gst_video_mastering_display_info_add_to_caps
++        (&h265parse->mastering_display_info, caps)) {
++      GST_WARNING_OBJECT (h265parse,
++          "Couldn't set mastering display info to caps");
++    }
++
++    if (s)
++      cll_str = gst_structure_get_string (s, "content-light-level");
++    if (cll_str) {
++      gst_caps_set_simple (caps, "content-light-level", G_TYPE_STRING, cll_str,
++          NULL);
++    } else if (h265parse->content_light_level_state !=
++        GST_H265_PARSE_SEI_EXPIRED &&
++        !gst_video_content_light_level_add_to_caps
++        (&h265parse->content_light_level, caps)) {
++      GST_WARNING_OBJECT (h265parse,
++          "Couldn't set content light level to caps");
++    }
++
+     src_caps = gst_pad_get_current_caps (GST_BASE_PARSE_SRC_PAD (h265parse));
+ 
+     if (src_caps) {
+diff --git a/gst/videoparsers/gsth265parse.h b/gst/videoparsers/gsth265parse.h
+index f523649..76e7b4d 100644
+--- a/gst/videoparsers/gsth265parse.h
++++ b/gst/videoparsers/gsth265parse.h
+@@ -24,6 +24,7 @@
+ #include <gst/gst.h>
+ #include <gst/base/gstbaseparse.h>
+ #include <gst/codecparsers/gsth265parser.h>
++#include <gst/video/video.h>
+ 
+ G_BEGIN_DECLS
+ 
+@@ -53,6 +54,7 @@ struct _GstH265Parse
+   gint upstream_par_n, upstream_par_d;
+   gint parsed_par_n, parsed_par_d;
+   gint parsed_fps_n, parsed_fps_d;
++  GstVideoColorimetry parsed_colorimetry;
+   /* current codec_data in output caps, if any */
+   GstBuffer *codec_data;
+   /* input codec_data, if any */
+@@ -111,6 +113,14 @@ struct _GstH265Parse
+ 
+   GstClockTime pending_key_unit_ts;
+   GstEvent *force_key_unit_event;
++
++  GstVideoMasteringDisplayInfo mastering_display_info;
++  guint mastering_display_info_state;
++
++  GstVideoContentLightLevel content_light_level;
++  guint content_light_level_state;
++  guint8 preferred_transfer_char;
++  guint alt_transfer_char_state;
+ };
+ 
+ struct _GstH265ParseClass
+-- 
+2.7.4
+

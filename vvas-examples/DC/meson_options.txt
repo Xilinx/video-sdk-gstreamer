@@ -1,0 +1,4 @@
+# Feature options for plugins without external deps
+option('enable_xrm', type : 'boolean', value : 'false')
+option('vvas_xabrladder', type : 'feature', value : 'auto')
+option('vvas_xcompositor', type : 'feature', value : 'auto')
