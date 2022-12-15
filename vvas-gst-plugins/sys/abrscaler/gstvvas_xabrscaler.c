@@ -2397,11 +2397,14 @@ gst_vvas_xabrscaler_class_init (GstVvasXAbrScalerClass * klass)
   gstelement_class->release_pad =
       GST_DEBUG_FUNCPTR (gst_vvas_xabrscaler_release_pad);
 
+#ifndef ENABLE_XRM_SUPPORT
   g_object_class_install_property (gobject_class, PROP_XCLBIN_LOCATION,
       g_param_spec_string ("xclbin-location", "xclbin file location",
           "Location of the xclbin to program devices", NULL,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
               GST_PARAM_MUTABLE_READY)));
+#endif
+
   g_object_class_install_property (gobject_class, PROP_KERN_NAME,
       g_param_spec_string ("kernel-name", "kernel name and instance",
           "String defining the kernel name and instance as mentioned in xclbin",

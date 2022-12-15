@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2019, Xilinx Inc - All rights reserved
- * Xilinx Lookahead XMA Plugin
+ * Xilinx Lookahead Plugin
  *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
  * not use this file except in compliance with the License. A copy of the
@@ -20,13 +20,14 @@
 #include <assert.h>
 #include <math.h>
 #include <string.h>
-//#include <xma.h>
 #include "xlnx_aq_core.h"
 #include "xlnx_rc_aq.h"
 #include "xlnx_spatial_aq.h"
 #include "xlnx_la_defines.h"
 
-#define XMA_XLNX_ALGOS "xlnx_aq_core"
+#define MAX(a,b) ( (a)>(b) ? (a) : (b) )
+#define MIN(a,b) ( (a)<(b) ? (a) : (b) )
+#define MV_HIST_BINS 64
 
 static const uint32_t XLNX_MIN_QP = 9;
 static const uint32_t XLNX_MAX_QP = 0;
@@ -43,7 +44,7 @@ typedef void *xlnx_aq_dump_t;
 typedef void *xlnx_qpmap_store_t;
 
 static int32_t xlnx_temporal_gen_qpmap(struct xlnx_aq_core_ctx *ctx,
-                                       const uint16_t *sadIn, uint64_t frame_num, uint32_t *frameSAD,
+                                       const uint16_t *sadIn, uint32_t dynamic_gop, uint64_t frame_num, uint32_t *frameSAD,
                                        xlnx_tp_qpmap_t *outMapCtx);
 static int32_t xlnx_temporal_gen_la_qpmap(struct xlnx_aq_core_ctx *ctx,
         xlnx_tp_qpmap_t *outMapCtx);
@@ -82,6 +83,7 @@ typedef struct xlnx_aq_core_ctx
     uint32_t temporal_aq_mode[XLNX_DEFAULT_LA_DEPTH + 1];
     uint32_t in_frame_num;
     uint32_t out_frame_num;
+    uint32_t dyn_frame_num;
     uint32_t rate_control_mode;
     uint32_t num_b_frames[XLNX_DEFAULT_LA_DEPTH + 1];
     uint32_t init_b_frames;
@@ -94,6 +96,7 @@ typedef struct xlnx_aq_core_ctx
     xlnx_spatial_aq_t sp_h;
     xlnx_codec_type_t codec_type;
     int32_t *tmp_hevc_map;
+    int32_t mv_histogram[MV_HIST_BINS];
 } xlnx_aq_core_ctx_t;
 
 static xlnx_qpmap_store_t create_qp_map_store(aq_config_t *cfg)
@@ -223,7 +226,6 @@ static int32_t dump_frame_block_sad(xlnx_aq_dump_t handle,
 static int32_t dump_frame_delta_qp_map(xlnx_aq_dump_t handle,
                                        uint8_t *deltaQpMap, uint32_t dump_length, uint64_t frame_num, uint8_t isLA)
 {
-    //printf("dump_frame_delta_qp_map frame_num=%lu isLA=%d\n", frame_num, isLA);
     FILE *f_DeltaQpMap = NULL;
     FILE *f_DeltaQpMapHex = NULL;
     xlnx_ap_dump_ctx_t *ctx = (xlnx_ap_dump_ctx_t *)handle;
@@ -233,8 +235,6 @@ static int32_t dump_frame_delta_qp_map(xlnx_aq_dump_t handle,
     char strbuf[512];
     const char *fileName;
 
-    /*printf("dump_frame_delta_qp_map frame_num=%lu isLA=%d dump_length=%u\n",
-           frame_num, isLA, dump_length);*/
     if (dumpCfg->dumpDeltaQpMap) {
         if (isLA) {
             sprintf(strbuf, "output/%s_LA-delta_QP_map_frame%ld.csv", dumpCfg->outPath,
@@ -299,17 +299,26 @@ static void init_aq_modes(xlnx_aq_core_ctx_t *ctx, aq_config_t *cfg)
     }
     ctx->in_frame_num = 0;
     ctx->out_frame_num = 0;
+    ctx->dyn_frame_num = 0;
+    return;
+}
+
+void update_num_b_frames(xlnx_aq_core_t handle, aq_config_t *cfg)
+{
+    xlnx_aq_core_ctx_t *ctx = (xlnx_aq_core_ctx_t *)handle;
+    ctx->num_b_frames[ctx->dyn_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = cfg->num_b_frames;
     return;
 }
 
 void update_aq_modes(xlnx_aq_core_t handle, aq_config_t *cfg)
 {
     xlnx_aq_core_ctx_t *ctx = (xlnx_aq_core_ctx_t *)handle;
-    ctx->spatial_aq_mode[ctx->in_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = cfg->spatial_aq_mode;
-    ctx->temporal_aq_mode[ctx->in_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = cfg->temporal_aq_mode;
-    ctx->num_b_frames[ctx->in_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = cfg->num_b_frames;
+    ctx->spatial_aq_mode[ctx->dyn_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = cfg->spatial_aq_mode;
+    ctx->temporal_aq_mode[ctx->dyn_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = cfg->temporal_aq_mode;
+    update_num_b_frames(handle, cfg);
 
     update_aq_gain(ctx->sp_h, cfg);
+    ctx->dyn_frame_num++;
     return;
 }
 
@@ -477,7 +486,7 @@ static inline int getFrameSad(xlnx_aq_core_ctx_t *ctx,  const uint16_t *sadIn,
 }
 
 static int32_t xlnx_temporal_gen_qpmap(xlnx_aq_core_ctx_t *ctx,
-                                       const uint16_t *sadIn,
+                                       const uint16_t *sadIn, uint32_t dynamic_gop,
                                        uint64_t frame_num, uint32_t *frameSAD, xlnx_tp_qpmap_t *outMapCtx)
 {
     int32_t avgBlockSad;
@@ -548,42 +557,50 @@ static int32_t xlnx_temporal_gen_qpmap(xlnx_aq_core_ctx_t *ctx,
     num_b_frames = ctx->num_b_frames[frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)];
     prev_b_frames = ctx->num_b_frames[(frame_num - 1)%(XLNX_DEFAULT_LA_DEPTH + 1)];
 
-    /* If number of B frames changes at run time, need to adjust the previous
-       P frame accordingly for correct P and B frame prediction. VCU encoder
-       always buffers initial B frames and when number of B frame changes, it
-       applies from the immediate sub GOP instead of the sub GOP that follows
-       the frame number at which the user changes B frames. */
+    /* initialize min and max qp for dynamic gop case */
+    minQp = 2;
+    maxQp = 2;
 
-    /* Example: Initial B frames is 4, user changes to 1 B frame at frame 100.
-       When 100th frame is given to the encoder, it is yet to encode 96th frame.
-       Since the sub GOP ends at 95th frame(P frame), it applies new B frame
-       changes from 96th frame encoding 96 as B, 97 as P and so on. */
+    if (!dynamic_gop) /* When dynamic gop is enabled there will be no difference for P and B frames (they will have the same delta qp range) */
+    {
+        /* If number of B frames changes at run time, need to adjust the previous
+           P frame accordingly for correct P and B frame prediction. VCU encoder
+           always buffers initial B frames and when number of B frame changes, it
+           applies from the immediate sub GOP instead of the sub GOP that follows
+           the frame number at which the user changes B frames. */
 
-    if(prev_b_frames != num_b_frames) {
-        uint32_t enc_gop_frame = frame_num - (ctx->init_b_frames + 1);
+           /* Example: Initial B frames is 4, user changes to 1 B frame at frame 100.
+              When 100th frame is given to the encoder, it is yet to encode 96th frame.
+              Since the sub GOP ends at 95th frame(P frame), it applies new B frame
+              changes from 96th frame encoding 96 as B, 97 as P and so on. */
+        if (prev_b_frames != num_b_frames) {
+            uint32_t enc_gop_frame = frame_num - (ctx->init_b_frames + 1);
 
-        if(enc_gop_frame != ctx->prev_p) {
-            /* The below loop updates the previous P frame according to the
-               encoder current state */
-            while((ctx->prev_p - (prev_b_frames + 1)) >= enc_gop_frame) {
-                ctx->prev_p -= (prev_b_frames + 1);
+            if (enc_gop_frame != ctx->prev_p) {
+                /* The below loop updates the previous P frame according to the
+                   encoder current state */
+                while ((ctx->prev_p - (prev_b_frames + 1)) >= enc_gop_frame) {
+                    ctx->prev_p -= (prev_b_frames + 1);
+                }
+            }
+
+            /* Adjust the prev_p closest to the frame number based on new sub GOP */
+            while ((ctx->prev_p + (num_b_frames + 1)) < frame_num) {
+                ctx->prev_p += (num_b_frames + 1);
             }
         }
 
-        /* Adjust the prev_p closest to the frame number based on new sub GOP */
-        while((ctx->prev_p + (num_b_frames + 1)) < frame_num) {
-            ctx->prev_p += (num_b_frames + 1);
+        /* Adjust the previous P for new GOP structure */
+        if ((frame_num == 0) || ((frame_num - ctx->prev_p) == (num_b_frames + 1)) ||
+            (frame_num == ctx->nextIntraFrame)) {
+            minQp = 6;
+            maxQp = 3;
+            ctx->prev_p = frame_num;
         }
-    }
-
-    if((frame_num == 0) || ((frame_num - ctx->prev_p) == (num_b_frames + 1)) ||
-      (frame_num == ctx->nextIntraFrame)){
-        minQp = 6;
-        maxQp = 3;
-        ctx->prev_p = frame_num;
-    } else {
-        minQp = 2;
-        maxQp = 2;
+        else {
+            minQp = 2;
+            maxQp = 2;
+        }
     }
 
     deltaQpMap = (int32_t *)xlnx_tp_qpmap_t->qpmap.ptr;
@@ -654,12 +671,10 @@ static int32_t xlnx_temporal_gen_la_qpmap(xlnx_aq_core_ctx_t *ctx,
         }
     }
     avgLaSad = accLaSad/numL1Lcu;
-    //printf("avgLaSad %d\t minLaBlockSad %d\t maxLaBlockSad %d\n", avgLaSad, minLaBlockSad, maxLaBlockSad);
 
     minLaDistance = abs(minLaBlockSad - avgLaSad);
     maxLaDistance = maxLaBlockSad - avgLaSad;
 
-    //printf("minLaDistance %d\t maxLaDistance %d\n", minLaDistance, maxLaDistance);
 
     if(minLaDistance < maxLaDistance) {
         maxLaDistance = minLaDistance;
@@ -722,7 +737,6 @@ static void merge_qp_maps(xlnx_aq_core_ctx_t *ctx, int32_t *temporal_qpmap,
 
     if (padded_w != actual_w) {
         remove_padding = 1;
-        //printf("padded_w = %u actual_w=%u\n", padded_w, actual_w);
     }
     for (i=0; i<num_mb; i++) {
         if (temporal_qpmap) {
@@ -749,7 +763,6 @@ static void merge_qp_maps(xlnx_aq_core_ctx_t *ctx, int32_t *temporal_qpmap,
             out_byte = getQpHexByte(temporal);
             if (remove_padding) {
                 if (((i+1) % padded_w) == actual_w) {
-                    //printf("skip @ i=%u by %u \n", i, padded_w - actual_w);
                     i = i + padded_w - actual_w;
 
                 }
@@ -758,7 +771,6 @@ static void merge_qp_maps(xlnx_aq_core_ctx_t *ctx, int32_t *temporal_qpmap,
         out_map[w_size] = out_byte;
         w_size++;
         if (w_size == cfg->qpmap_size) {
-            //printf("break at i=%u num_mb = %u map_size =%u %u \n",i, num_mb, w_size, cfg->qpmap_size);
             break;
         }
     }
@@ -785,7 +797,6 @@ static void merge_qp_maps_hevc(xlnx_aq_core_ctx_t *ctx, int32_t *temporal_qpmap,
 
     if (padded_w != actual_w) {
         remove_padding = 1;
-        //printf("padded_w = %u actual_w=%u\n", padded_w, actual_w);
     }
     for (i=0; i<num_mb; i++) {
         if (temporal_qpmap) {
@@ -812,7 +823,6 @@ static void merge_qp_maps_hevc(xlnx_aq_core_ctx_t *ctx, int32_t *temporal_qpmap,
             out_qp = temporal;
             if (remove_padding) {
                 if (((i+1) % padded_w) == actual_w) {
-                    //printf("skip @ i=%u by %u \n", i, padded_w - actual_w);
                     i = i + padded_w - actual_w;
 
                 }
@@ -821,7 +831,6 @@ static void merge_qp_maps_hevc(xlnx_aq_core_ctx_t *ctx, int32_t *temporal_qpmap,
         hevc_map[w_size] = out_qp;
         w_size++;
         if (w_size == cfg->qpmap_size) {
-            //printf("break at i=%u num_mb = %u map_size =%u %u \n",i, num_mb, w_size, cfg->qpmap_size);
             break;
         }
     }
@@ -851,7 +860,101 @@ static void merge_qp_maps_hevc(xlnx_aq_core_ctx_t *ctx, int32_t *temporal_qpmap,
         }
     }
 }
-static xlnx_status generateQPMap(xlnx_aq_core_t handle, uint64_t frame_num,
+
+/* This function calculates the histogram of motion vectors coming from the
+   lookahead. Using the histograme, amount of motion in the frame (low,
+   medium and high) is also computed.*/
+xlnx_status generate_mv_histogram(xlnx_aq_core_t handle, uint64_t frame_num,
+    const uint32_t* mvIn, uint32_t isLastFrame,
+    int32_t* frame_complexity, int32_t is_idr)
+{
+    xlnx_aq_core_ctx_t* ctx = (xlnx_aq_core_ctx_t*)handle;
+    aq_config_t* cfg = ctx->cfg;
+
+    const uint32_t* mv = mvIn;
+
+    uint32_t x, y;
+    int16_t mv_x, mv_y;
+    uint16_t mv_index;
+    uint32_t sum_hist, thres_hist, seven_eighth_hist, three_forth_hist;
+    uint32_t sum_2Bins;
+
+    uint32_t blockWidth = cfg->blockWidth;
+    uint32_t blockHeight = cfg->blockHeight;
+    int32_t outWidth = cfg->outWidth;
+    int32_t outHeight = cfg->outHeight;
+    *frame_complexity = 0;
+
+    /* reset mv_hist buffer */
+    for (x = 0; x < MV_HIST_BINS; x++)
+        ctx->mv_histogram[x] = 0;
+
+
+    /* unpacking the mv_x and mv_y info from the 32 bit and compute histogram */
+    for (y = 0; y < outHeight; y += blockHeight) {
+        for (x = 0; x < outWidth; x += blockWidth) {
+            mv_x = (int16_t)((*mv) & 0x0000FFFF);
+            mv_y = (int16_t)(((*mv) >> 16) & 0x0000FFFF);
+            mv_index = MIN((uint16_t)(MV_HIST_BINS - 1), (uint16_t)(MAX(abs(mv_x), abs(mv_y)) >> 1));
+            ctx->mv_histogram[mv_index]++;
+
+            mv++;
+        }
+    }
+
+    /* Determine frame complexity */
+    sum_hist = 0;
+    for (x = 0; x < MV_HIST_BINS; x++)
+        sum_hist += ctx->mv_histogram[x];
+
+    three_forth_hist = (sum_hist * 3) >> 2;
+    seven_eighth_hist = (sum_hist * 7) >> 3;
+    thres_hist = sum_hist >> 1;
+
+    if (ctx->codec_type == EXlnxAvc) {
+        sum_hist = ctx->mv_histogram[0] + ctx->mv_histogram[1];
+
+        if (sum_hist > seven_eighth_hist)
+        {
+            /* low motion */
+            *frame_complexity = LOW_MOTION;
+        }
+        else if (sum_hist < thres_hist)
+        {
+            /* high motion */
+            *frame_complexity = HIGH_MOTION;
+        }
+        else
+        {
+            /* medium motion */
+            *frame_complexity = MEDIUM_MOTION;
+        }
+    }
+    else { /* codec_type = EXlnxHEVC */
+        sum_2Bins = ctx->mv_histogram[0] + ctx->mv_histogram[1];
+        sum_hist = ctx->mv_histogram[0] + ctx->mv_histogram[1] + ctx->mv_histogram[2] + ctx->mv_histogram[3];
+
+        if (sum_2Bins > three_forth_hist)
+        {
+            /* low motion */
+            *frame_complexity = LOW_MOTION;
+        }
+        else if (sum_hist < thres_hist)
+        {
+            /* high motion */
+            *frame_complexity = HIGH_MOTION;
+        }
+        else
+        {
+            /* medium motion */
+            *frame_complexity = MEDIUM_MOTION;
+        }
+    }
+
+    return EXlnxSuccess;
+}
+
+static xlnx_status generateQPMap(xlnx_aq_core_t handle, uint32_t dynamic_gop, uint64_t frame_num,
                                  const uint16_t *sadIn,
                                  const uint32_t *var_energy_map, const uint16_t *act_energy_map,
                                  uint32_t isLastFrame,
@@ -919,7 +1022,7 @@ static xlnx_status generateQPMap(xlnx_aq_core_t handle, uint64_t frame_num,
         LOG_MESSAGE(LOG_LEVEL_DEBUG, "frame_num=%lu ctx->isDeltaQpMapLAPending=%u",
                    frame_num, ctx->isDeltaQpMapLAPending);
 
-        if (xlnx_temporal_gen_qpmap(ctx, sadIn, frame_num, frame_sad,
+        if (xlnx_temporal_gen_qpmap(ctx, sadIn, dynamic_gop, frame_num, frame_sad,
                                     xlnx_tp_qpmap_t)) {
             return EXlnxTryAgain;
         }
@@ -959,7 +1062,7 @@ static xlnx_status generateQPMap(xlnx_aq_core_t handle, uint64_t frame_num,
     return EXlnxSuccess;
 }
 
-xlnx_status send_frame_stats(xlnx_aq_core_t handle, uint64_t frame_num,
+xlnx_status send_frame_stats(xlnx_aq_core_t handle, uint32_t dynamic_gop, uint64_t frame_num,
                              xlnx_frame_stats *stats,
                              uint32_t isLastFrame, int32_t is_idr)
 {
@@ -977,7 +1080,7 @@ xlnx_status send_frame_stats(xlnx_aq_core_t handle, uint64_t frame_num,
         actIn = stats->act;
     }
 
-    ret = generateQPMap(handle, frame_num, sadIn, varIn, actIn, isLastFrame,
+    ret = generateQPMap(handle, dynamic_gop, frame_num, sadIn, varIn, actIn, isLastFrame,
                         &frame_activity, &frame_sad, is_idr);
     if (ret != EXlnxSuccess && stats && !isLastFrame) {
         return ret;
@@ -1003,7 +1106,6 @@ xlnx_status send_frame_stats(xlnx_aq_core_t handle, uint64_t frame_num,
             ret = xlnx_algo_rc_write_fsfa(ctx->rc_h, &fsfa);
             if (isLastFrame) {
                 LOG_MESSAGE(LOG_LEVEL_DEBUG, "EOS sent from xlnx algos");
-                //printf("EOS sent from xlnx algos\n");
                 xlnx_algo_rc_write_fsfa(ctx->rc_h, NULL);
             }
         } else {

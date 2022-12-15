@@ -76,11 +76,16 @@ FILE *fsfa_fp = NULL;
 #define DEFAULT_SPATIAL_AQ_GAIN_PERCENT 50
 #define DEFAULT_CODEC_TYPE VVAS_CODEC_NONE
 #define DEFAULT_NUM_B_FRAMES 2
+#define UNSET_NUM_B_FRAMES -1
 #define DEFAULT_GOP_SIZE 120
 #define DEFAULT_DEVICE_INDEX -1
+#define DEFAULT_MIN_QP 0
+#define DEFAULT_MAX_QP 51
 #define VVAS_LOOKAHEAD_KERNEL_NAME_DEFAULT "lookahead:lookahead_1"
 #define VVAS_LOOKAHEAD_QUERY_NAME "VVASLookaheadQuery"
+#define VVAS_ENCODER_QUERY_NAME "VVASEncoderQuery"
 #define VVAS_LOOKAHEAD_DEFAULT_ENABLE_PIPLINE FALSE
+#define VVAS_LOOKAHEAD_DEFAULT_DYNAMIC_GOP FALSE
 #define STOP_COMMAND ((gpointer)GINT_TO_POINTER (g_quark_from_string("STOP")))
 
 static const int ERT_CMD_SIZE = 4096;
@@ -93,6 +98,7 @@ static const int ERT_CMD_SIZE = 4096;
 #define XLNX_ALIGN(x,LINE_SIZE) (((((size_t)x) + ((size_t)LINE_SIZE - 1)) & (~((size_t)LINE_SIZE - 1))))
 #define BLOCK_WIDTH 4
 #define BLOCK_HEIGHT 4
+#define DYNAMIC_GOP_MIN_LOOKAHEAD_DEPTH 5
 
 static const char *outFilePath = "delta_qpmap";
 
@@ -107,11 +113,9 @@ enum
   PROP_0,
   PROP_DEVICE_INDEX,
   PROP_XCLBIN_LOCATION,
-  PROP_GOP_LENGTH,
   PROP_LOOKAHEAD_DEPTH,
   PROP_SPATIAL_AQ,
   PROP_TEMPORAL_AQ,
-  PROP_ENABLE_RATE_CONTROL,
   PROP_SPATIAL_AQ_GAIN,
   PROP_CODEC_TYPE,
   PROP_NUM_BFRAMES,
@@ -120,6 +124,9 @@ enum
 #ifdef ENABLE_XRM_SUPPORT
   PROP_RESERVATION_ID,
 #endif
+  PROP_DYNAMIC_GOP,
+  PROP_MIN_QP,
+  PROP_MAX_QP,
 };
 
 struct _Vvvas_incopy_object
@@ -159,7 +166,7 @@ struct _GstVvas_XLookAheadPrivate
   gboolean enable_rate_control;
   guint spatial_aq_gain;
   VvasCodecType codec_type;
-  guint num_bframes;
+  gint num_bframes;
   xlnx_aq_core_t qp_handle;
   GstBuffer *prev_inbuf;
   guint var_off;
@@ -173,6 +180,7 @@ struct _GstVvas_XLookAheadPrivate
   gboolean has_error;
   gboolean is_idr;
   gboolean enabled_pipeline;
+  gboolean ultra_low_latency;
   GThread *input_copy_thread;
   GAsyncQueue *copy_inqueue;
   GAsyncQueue *copy_outqueue;
@@ -184,6 +192,11 @@ struct _GstVvas_XLookAheadPrivate
   gint reservation_id;
   gint cur_load;
 #endif
+  gboolean dynamic_gop;
+  guint bframes[XLNX_DYNAMIC_GOP_CACHE];
+  gint frame_complexity[XLNX_DYNAMIC_GOP_INTERVAL];
+  guint min_qp;
+  guint max_qp;
 };
 
 #define VVAS_LOOKAHEAD_CAPS \
@@ -213,8 +226,8 @@ static void gst_vvas_xlookahead_set_property (GObject * object, guint prop_id,
 static void gst_vvas_xlookahead_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
 static void gst_vvas_xlookahead_finalize (GObject * obj);
-static GstFlowReturn gst_vvas_xlookahead_submit_input_buffer (GstBaseTransform * trans,
-    gboolean discont, GstBuffer * inbuf);
+static GstFlowReturn gst_vvas_xlookahead_submit_input_buffer (GstBaseTransform *
+    trans, gboolean discont, GstBuffer * inbuf);
 
 GType
 vvas_xlookahead_get_codec_type (void)
@@ -246,7 +259,7 @@ xlnx_align_to_base (size_t s, size_t align_base)
 static void
 vvas_xlookahead_copy_object_unref (gpointer data)
 {
-  VvasIncopyObject *copy_obj = (VvasIncopyObject *)data;
+  VvasIncopyObject *copy_obj = (VvasIncopyObject *) data;
   if (copy_obj->inbuf)
     gst_buffer_unref (copy_obj->inbuf);
   if (copy_obj->copy_inbuf)
@@ -294,9 +307,9 @@ vvas_xlookahead_get_outsize (GstVvas_XLookAheadPrivate * priv, uint32_t num_b,
   Bpb = 4;
   totalSize += xlnx_align_to_base (num_b * Bpb, LINMEM_ALIGN_4K);
 
-  *length = totalSize;
   priv->mv_off = totalSize;
   totalSize += xlnx_align_to_base (num_b * Bpb, LINMEM_ALIGN_4K);
+  *length = totalSize;
 
   return totalSize;
 }
@@ -373,7 +386,7 @@ vvas_xlookahead_allocate_stats_pool (GstVvas_XLookAhead * self, guint out_size)
 
   config = gst_buffer_pool_get_config (pool);
   gst_buffer_pool_config_set_params (config, NULL, out_size, MIN_POOL_BUFFERS,
-      self->priv->lookahead_depth+1);
+      self->priv->lookahead_depth + 1);
   gst_buffer_pool_config_set_allocator (config, allocator, &alloc_params);
 
   if (!gst_buffer_pool_set_config (pool, config)) {
@@ -458,8 +471,8 @@ vvas_xlookahead_allocate_metadata_pools (GstVvas_XLookAhead * self)
 
 #ifdef ENABLE_XRM_SUPPORT
 static gchar *
-vvas_xlookahead_prepare_request_json_string (GstVvas_XLookAhead *self,
-    GstVideoInfo *in_vinfo)
+vvas_xlookahead_prepare_request_json_string (GstVvas_XLookAhead * self,
+    GstVideoInfo * in_vinfo)
 {
   json_t *req_obj;
   gchar *req_str;
@@ -481,11 +494,11 @@ vvas_xlookahead_prepare_request_json_string (GstVvas_XLookAhead *self,
     g_warning ("frame rate not available in caps, taking default fps as 60");
     fps_n = 60;
     fps_d = 1;
-   }
+  }
 
   req_obj = json_pack ("{s:{s:{s:[{s:s,s:s,s:{s:{s:i,s:i,s:{s:i,s:i}}}}]}}}",
-      "request", "parameters", "resources","function","ENCODER",
-      "format", self->priv->codec_type == VVAS_CODEC_H264 ? "H264":"H265",
+      "request", "parameters", "resources", "function", "ENCODER",
+      "format", self->priv->codec_type == VVAS_CODEC_H264 ? "H264" : "H265",
       "resolution", "input", "width", in_width, "height", in_height,
       "frame-rate", "num", fps_n, "den", fps_d);
 
@@ -498,8 +511,8 @@ vvas_xlookahead_prepare_request_json_string (GstVvas_XLookAhead *self,
 }
 
 static gboolean
-vvas_xlookahead_calculate_load (GstVvas_XLookAhead *self, gint *load,
-    GstVideoInfo *vinfo)
+vvas_xlookahead_calculate_load (GstVvas_XLookAhead * self, gint * load,
+    GstVideoInfo * vinfo)
 {
   GstVvas_XLookAheadPrivate *priv = self->priv;
   int iret = -1, func_id = 0;
@@ -522,20 +535,20 @@ vvas_xlookahead_calculate_load (GstVvas_XLookAhead *self, gint *load,
   memset (&param, 0x0, sizeof (xrmPluginFuncParam));
   memset (plugin_name, 0x0, XRM_MAX_NAME_LEN);
 
-  strcpy(plugin_name, "xrmU30EncPlugin");
+  strcpy (plugin_name, "xrmU30EncPlugin");
 
   if (strlen (req_str) > (XRM_MAX_PLUGIN_FUNC_PARAM_LEN - 1)) {
-    GST_ERROR_OBJECT(self, "request input string length %lu > max allowed %d",
-        strlen (req_str), XRM_MAX_PLUGIN_FUNC_PARAM_LEN-1);
+    GST_ERROR_OBJECT (self, "request input string length %lu > max allowed %d",
+        strlen (req_str), XRM_MAX_PLUGIN_FUNC_PARAM_LEN - 1);
     return FALSE;
   }
 
-  strncpy(param.input, req_str, XRM_MAX_PLUGIN_FUNC_PARAM_LEN);
+  strncpy (param.input, req_str, XRM_MAX_PLUGIN_FUNC_PARAM_LEN);
   free (req_str);
 
-  iret = xrmExecPluginFunc(priv->xrm_ctx, plugin_name, func_id, &param);
+  iret = xrmExecPluginFunc (priv->xrm_ctx, plugin_name, func_id, &param);
   if (iret != XRM_SUCCESS) {
-    GST_ERROR_OBJECT(self, "failed to get load from xrm plugin. err : %d",
+    GST_ERROR_OBJECT (self, "failed to get load from xrm plugin. err : %d",
         iret);
     GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
         ("failed to get load from xrm plugin"), NULL);
@@ -543,11 +556,11 @@ vvas_xlookahead_calculate_load (GstVvas_XLookAhead *self, gint *load,
   }
 
   /* skip encoder load & number of encoders in payload */
-  strtok_r(param.output, " ", &save_ptr);
-  strtok_r(NULL, " ", &save_ptr);
+  strtok_r (param.output, " ", &save_ptr);
+  strtok_r (NULL, " ", &save_ptr);
 
-  /* taking la load in param.output*/
-  *load = atoi((char *)(strtok_r(NULL, " ", &save_ptr)));
+  /* taking la load in param.output */
+  *load = atoi ((char *) (strtok_r (NULL, " ", &save_ptr)));
 
   if (*load <= 0 || *load > XRM_MAX_CHAN_LOAD_GRANULARITY_1000000) {
     GST_ERROR_OBJECT (self, "not an allowed lookahead load %d", *load);
@@ -556,7 +569,8 @@ vvas_xlookahead_calculate_load (GstVvas_XLookAhead *self, gint *load,
     return FALSE;
   }
 
-  GST_INFO_OBJECT (self, "need %d%% device's load", (*load * 100) / XRM_MAX_CHAN_LOAD_GRANULARITY_1000000);
+  GST_INFO_OBJECT (self, "need %d%% device's load",
+      (*load * 100) / XRM_MAX_CHAN_LOAD_GRANULARITY_1000000);
   return TRUE;
 }
 
@@ -566,9 +580,10 @@ vvas_xlookahead_allocate_resource (GstVvas_XLookAhead * self, gint la_load)
   GstVvas_XLookAheadPrivate *priv = self->priv;
   int iret = -1;
 
-  GST_INFO_OBJECT (self, "going to request %d%% load using xrm", (la_load * 100) / XRM_MAX_CHAN_LOAD_GRANULARITY_1000000);
+  GST_INFO_OBJECT (self, "going to request %d%% load using xrm",
+      (la_load * 100) / XRM_MAX_CHAN_LOAD_GRANULARITY_1000000);
 
-  if (getenv("XRM_RESERVE_ID") || priv->reservation_id) { /* use reservation_id to allocate LA */
+  if (getenv ("XRM_RESERVE_ID") || priv->reservation_id) {      /* use reservation_id to allocate LA */
     int xrm_reserve_id = 0;
     xrmCuPropertyV2 la_prop;
     xrmCuResourceV2 *cu_resource;
@@ -578,7 +593,8 @@ vvas_xlookahead_allocate_resource (GstVvas_XLookAhead * self, gint la_load)
     if (!priv->cu_resource_v2) {
       cu_resource = (xrmCuResourceV2 *) calloc (1, sizeof (xrmCuResourceV2));
       if (!cu_resource) {
-        GST_ERROR_OBJECT (self, "failed to allocate memory for hardCU resource");
+        GST_ERROR_OBJECT (self,
+            "failed to allocate memory for hardCU resource");
         return FALSE;
       }
     } else {
@@ -589,25 +605,29 @@ vvas_xlookahead_allocate_resource (GstVvas_XLookAhead * self, gint la_load)
     if (priv->reservation_id)
       xrm_reserve_id = priv->reservation_id;
     else
-      xrm_reserve_id = atoi(getenv("XRM_RESERVE_ID"));
+      xrm_reserve_id = atoi (getenv ("XRM_RESERVE_ID"));
 
     la_prop.poolId = xrm_reserve_id;
-    strcpy(la_prop.kernelName, strtok(priv->kernel_name, ":"));
-    strcpy(la_prop.kernelAlias, "LOOKAHEAD_MPSOC");
+    strcpy (la_prop.kernelName, strtok (priv->kernel_name, ":"));
+    strcpy (la_prop.kernelAlias, "LOOKAHEAD_MPSOC");
     la_prop.devExcl = false;
-    la_prop.requestLoad = XRM_PRECISION_1000000_BIT_MASK(la_load);
+    la_prop.requestLoad = XRM_PRECISION_1000000_BIT_MASK (la_load);
 
     if (priv->dev_idx != -1) {
-      uint64_t deviceInfoContraintType = XRM_DEVICE_INFO_CONSTRAINT_TYPE_HARDWARE_DEVICE_INDEX;
+      uint64_t deviceInfoContraintType =
+          XRM_DEVICE_INFO_CONSTRAINT_TYPE_HARDWARE_DEVICE_INDEX;
       uint64_t deviceInfoDeviceIndex = priv->dev_idx;
 
-      la_prop.deviceInfo = (deviceInfoDeviceIndex << XRM_DEVICE_INFO_DEVICE_INDEX_SHIFT) |
-			      (deviceInfoContraintType << XRM_DEVICE_INFO_CONSTRAINT_TYPE_SHIFT);
+      la_prop.deviceInfo =
+          (deviceInfoDeviceIndex << XRM_DEVICE_INFO_DEVICE_INDEX_SHIFT) |
+          (deviceInfoContraintType << XRM_DEVICE_INFO_CONSTRAINT_TYPE_SHIFT);
     }
 
     iret = xrmCuAllocV2 (priv->xrm_ctx, &la_prop, cu_resource);
     if (iret != XRM_SUCCESS) {
-      GST_ERROR_OBJECT(self, "failed to allocate resources from reservation id %d", xrm_reserve_id);
+      GST_ERROR_OBJECT (self,
+          "failed to allocate resources from reservation id %d",
+          xrm_reserve_id);
       GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
           ("failed to allocate resources from reservation id %d",
               xrm_reserve_id), NULL);
@@ -618,7 +638,7 @@ vvas_xlookahead_allocate_resource (GstVvas_XLookAhead * self, gint la_load)
     uuid_copy (priv->xclbinId, cu_resource->uuid);
     priv->cu_resource_v2 = cu_resource;
 
-  } else { /* use user specified device to allocate scaler */
+  } else {                      /* use user specified device to allocate scaler */
     xrmCuProperty la_prop;
     xrmCuResource *cu_resource;
 
@@ -627,7 +647,8 @@ vvas_xlookahead_allocate_resource (GstVvas_XLookAhead * self, gint la_load)
     if (!priv->cu_resource) {
       cu_resource = (xrmCuResource *) calloc (1, sizeof (xrmCuResource));
       if (!cu_resource) {
-        GST_ERROR_OBJECT (self, "failed to allocate memory for hardCU resource");
+        GST_ERROR_OBJECT (self,
+            "failed to allocate memory for hardCU resource");
         return FALSE;
       }
     } else {
@@ -635,20 +656,20 @@ vvas_xlookahead_allocate_resource (GstVvas_XLookAhead * self, gint la_load)
     }
 
     if (priv->dev_idx >= xclProbe ()) {
-      GST_ERROR_OBJECT (self, "Cannot find device index %d", priv->dev_idx );
+      GST_ERROR_OBJECT (self, "Cannot find device index %d", priv->dev_idx);
       GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
-          ("failed to find device index %d", priv->dev_idx ), NULL);
+          ("failed to find device index %d", priv->dev_idx), NULL);
       return FALSE;
     }
-    strcpy(la_prop.kernelName, strtok(priv->kernel_name, ":"));
-    strcpy(la_prop.kernelAlias, "LOOKAHEAD_MPSOC");
+    strcpy (la_prop.kernelName, strtok (priv->kernel_name, ":"));
+    strcpy (la_prop.kernelAlias, "LOOKAHEAD_MPSOC");
     la_prop.devExcl = false;
-    la_prop.requestLoad = XRM_PRECISION_1000000_BIT_MASK(la_load);
+    la_prop.requestLoad = XRM_PRECISION_1000000_BIT_MASK (la_load);
 
-    iret = xrmCuAllocFromDev(priv->xrm_ctx, priv->dev_idx, &la_prop,
+    iret = xrmCuAllocFromDev (priv->xrm_ctx, priv->dev_idx, &la_prop,
         cu_resource);
     if (iret != XRM_SUCCESS) {
-      GST_ERROR_OBJECT(self, "failed to allocate resources from device id %d. "
+      GST_ERROR_OBJECT (self, "failed to allocate resources from device id %d. "
           "error: %d", priv->dev_idx, iret);
       GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
           ("failed to allocate resources from device id %d", priv->dev_idx),
@@ -667,7 +688,8 @@ vvas_xlookahead_allocate_resource (GstVvas_XLookAhead * self, gint la_load)
   }
 
   GST_INFO_OBJECT (self, "dev_idx = %d, cu_idx = %d & load = %d",
-      priv->dev_idx, priv->cu_idx, (la_load * 100) / XRM_MAX_CHAN_LOAD_GRANULARITY_1000000);
+      priv->dev_idx, priv->cu_idx,
+      (la_load * 100) / XRM_MAX_CHAN_LOAD_GRANULARITY_1000000);
 
   return TRUE;
 }
@@ -689,20 +711,18 @@ vvas_xlookahead_create_context (GstVvas_XLookAhead * self)
     return FALSE;
 #endif
 
-  if (((unsigned int)priv->dev_idx) >= xclProbe ()) {
+  if (((unsigned int) priv->dev_idx) >= xclProbe ()) {
     GST_ERROR_OBJECT (self, "device index %d is not valid", priv->dev_idx);
     GST_ELEMENT_ERROR (self, RESOURCE, FAILED, (NULL),
         ("device index %d is not valid", priv->dev_idx));
     return FALSE;
   }
-
 #ifdef ENABLE_XRM_SUPPORT
   priv->xcl_handle = xclOpen (priv->dev_idx, NULL, XCL_INFO);
   if (!priv->xcl_handle) {
     GST_ERROR_OBJECT (self, "failed to open device index %u", priv->dev_idx);
     return FALSE;
   }
-
 #else
   if (!priv->xclbin_path) {
     GST_ERROR_OBJECT (self, "invalid xclbin path %s", priv->xclbin_path);
@@ -763,7 +783,7 @@ vvas_xlookahead_destroy_context (GstVvas_XLookAhead * self)
       GST_ERROR_OBJECT (self, "failed to destroy xrm context");
       has_error = TRUE;
     }
-    free(priv->cu_resource_v2);
+    free (priv->cu_resource_v2);
     priv->cu_resource_v2 = NULL;
     GST_INFO_OBJECT (self, "released CU and destroyed xrm context");
   }
@@ -782,7 +802,7 @@ vvas_xlookahead_destroy_context (GstVvas_XLookAhead * self)
       GST_ERROR_OBJECT (self, "failed to destroy xrm context");
       has_error = TRUE;
     }
-    free(priv->cu_resource);
+    free (priv->cu_resource);
     priv->cu_resource = NULL;
     GST_INFO_OBJECT (self, "released CU and destroyed xrm context");
   }
@@ -841,7 +861,7 @@ vvas_xlookahead_input_copy_thread (gpointer data)
 
     /* map input buffer in read mode */
     if (!gst_video_frame_map (&in_vframe, self->priv->in_vinfo, inbuf,
-        GST_MAP_READ)) {
+            GST_MAP_READ)) {
       GST_ERROR_OBJECT (self, "failed to map input buffer");
       goto error;
     }
@@ -963,6 +983,47 @@ config_failed:
   }
 }
 
+static void
+dynamic_gop_update_b_frames (GstVvas_XLookAhead * self)
+{
+  GstVvas_XLookAheadPrivate *priv = self->priv;
+  guint b_frames = 1, it = 0;
+  guint countLow = 0, countHigh = 0;
+
+  /* Update for every fourth frame. */
+  if (priv->frame_num <= 0
+      || priv->frame_num % XLNX_DYNAMIC_GOP_INTERVAL !=
+      (XLNX_DYNAMIC_GOP_INTERVAL - 1)) {
+    return;
+  }
+
+  for (it = 0; it < XLNX_DYNAMIC_GOP_INTERVAL; it++) {
+    if (priv->frame_complexity[it] == LOW_MOTION)
+      countLow = countLow + 1;
+    if (priv->frame_complexity[it] == HIGH_MOTION)
+      countHigh = countHigh + 1;
+  }
+
+  if (priv->codec_type == VVAS_CODEC_H264) {
+    if (countLow == 4) {        /* all frames are low motion */
+      b_frames = 2;
+    } else if (countHigh >= 1) {        /* atleast one of the frames is high motion */
+      b_frames = 0;
+    }
+  } else {
+    if (countLow >= 2) {        /* atleast 2 frames are low motion */
+      b_frames = 2;
+    } else if (countHigh == 4) {        /* all frames are high motion */
+      b_frames = 0;
+    }
+  }
+
+  priv->bframes[(priv->frame_num / XLNX_DYNAMIC_GOP_INTERVAL) %
+      XLNX_DYNAMIC_GOP_CACHE] = b_frames;
+  priv->qpmap_cfg.num_b_frames = b_frames;
+  return;
+}
+
 static gpointer
 gst_vvas_xlookahead_postproc_loop (gpointer data)
 {
@@ -977,6 +1038,7 @@ gst_vvas_xlookahead_postproc_loop (gpointer data)
     GstMapInfo map_info = GST_MAP_INFO_INIT;
     gboolean is_last_stat = FALSE;
     xlnx_status algo_status = EXlnxSuccess;
+    xlnx_status mv_status = EXlnxSuccess;
     GstEvent *eos_event = NULL;
     GstVvasLAMeta *statslameta = NULL;
 
@@ -1003,15 +1065,15 @@ gst_vvas_xlookahead_postproc_loop (gpointer data)
     obj = g_queue_pop_head (priv->stats_queue);
     g_mutex_unlock (&priv->proc_lock);
 
-    if (GST_IS_EVENT(obj)) {
-      if (GST_EVENT_TYPE (GST_EVENT(obj)) == GST_EVENT_EOS) {
+    if (GST_IS_EVENT (obj)) {
+      if (GST_EVENT_TYPE (GST_EVENT (obj)) == GST_EVENT_EOS) {
         priv->is_eos = TRUE;
-        eos_event = GST_EVENT(obj);
+        eos_event = GST_EVENT (obj);
         if (!priv->qp_handle)
           goto send_eos;
       }
     } else {
-      stats_buf = GST_BUFFER(obj);
+      stats_buf = GST_BUFFER (obj);
     }
 
     if (stats_buf) {
@@ -1023,14 +1085,16 @@ gst_vvas_xlookahead_postproc_loop (gpointer data)
         continue;
       }
 
-      priv->qpmap_cfg.spatial_aq_mode = statslameta->spatial_aq ? XLNX_AQ_SPATIAL_AUTOVARIANCE :
-          XLNX_AQ_NONE;
-      priv->qpmap_cfg.temporal_aq_mode = statslameta->temporal_aq ? XLNX_AQ_TEMPORAL_LINEAR :
-          XLNX_AQ_NONE;
+      priv->qpmap_cfg.spatial_aq_mode =
+          statslameta->spatial_aq ? XLNX_AQ_SPATIAL_AUTOVARIANCE : XLNX_AQ_NONE;
+      priv->qpmap_cfg.temporal_aq_mode =
+          statslameta->temporal_aq ? XLNX_AQ_TEMPORAL_LINEAR : XLNX_AQ_NONE;
       priv->qpmap_cfg.spatial_aq_gain = statslameta->spatial_aq_gain;
-      priv->qpmap_cfg.num_b_frames = statslameta->num_bframes;
-      
-      update_aq_modes(priv->qp_handle, &priv->qpmap_cfg);
+      if (!priv->dynamic_gop) {
+        priv->qpmap_cfg.num_b_frames = statslameta->num_bframes;
+      }
+
+      update_aq_modes (priv->qp_handle, &priv->qpmap_cfg);
 
       if (!gst_buffer_map (stats_buf, &map_info, GST_MAP_READ)) {
         GST_ERROR_OBJECT (self, "failed to map stats buffer!");
@@ -1044,9 +1108,7 @@ gst_vvas_xlookahead_postproc_loop (gpointer data)
       /* process stats buffer & attach AQ info as metadata to GstBuffer */
       stats.num_blocks = priv->num_mb;
 
-      /* only SPATIAL_AQ_AUTOVARIANCE is supported */
-      if (priv->spatial_aq)
-        stats.var = (uint32_t *) (map_info.data + priv->var_off);
+      stats.var = (uint32_t *) (map_info.data + priv->var_off);
 
       /* Custom rate control uses frame sad + frame activity */
       if (priv->enable_rate_control)
@@ -1054,8 +1116,25 @@ gst_vvas_xlookahead_postproc_loop (gpointer data)
 
       stats.sad = (uint16_t *) (map_info.data + priv->sad_off);
 
-      if(send_frame_stats (priv->qp_handle, priv->frame_num, &stats, is_last_stat,
-            statslameta->is_idr) == EXlnxError) {
+      stats.mv = (uint32_t *) (map_info.data + priv->mv_off);
+
+      if (priv->dynamic_gop) {
+        if (stats.mv != NULL) {
+          mv_status =
+              generate_mv_histogram (priv->qp_handle, priv->frame_num, stats.mv,
+              is_last_stat,
+              &priv->frame_complexity[priv->frame_num %
+                  XLNX_DYNAMIC_GOP_INTERVAL], statslameta->is_idr);
+          if (mv_status != EXlnxSuccess && !is_last_stat) {
+            priv->last_fret = GST_FLOW_ERROR;
+            return NULL;
+          }
+        }
+        dynamic_gop_update_b_frames (self);
+      }
+
+      if (send_frame_stats (priv->qp_handle, priv->dynamic_gop, priv->frame_num,
+              &stats, is_last_stat, statslameta->is_idr) == EXlnxError) {
         priv->last_fret = GST_FLOW_ERROR;
         GST_ELEMENT_ERROR (self, STREAM, FAILED, ("FAILED QP map generation"),
             ("FAILED QP map generation"));
@@ -1067,7 +1146,8 @@ gst_vvas_xlookahead_postproc_loop (gpointer data)
       gst_buffer_unref (stats_buf);
     } else if (priv->is_eos) {
       GST_INFO_OBJECT (self, "sending last frame to lookahead on EOS");
-      if(send_frame_stats (priv->qp_handle, priv->frame_num, NULL, 1, 0) == EXlnxError) {
+      if (send_frame_stats (priv->qp_handle, priv->dynamic_gop, priv->frame_num,
+              NULL, 1, 0) == EXlnxError) {
         priv->last_fret = GST_FLOW_ERROR;
         GST_ELEMENT_ERROR (self, STREAM, FAILED, ("FAILED QP map generation"),
             ("FAILED QP map generation"));
@@ -1145,7 +1225,9 @@ gst_vvas_xlookahead_postproc_loop (gpointer data)
 
       if (statslameta)
         is_idr = statslameta->is_idr;
-      algo_status = recv_frame_aq_info (priv->qp_handle, &vqInfo, priv->frame_num, is_idr);
+      algo_status =
+          recv_frame_aq_info (priv->qp_handle, &vqInfo, priv->frame_num,
+          is_idr);
 
       if (qpmap_buf) {
         gst_buffer_unmap (qpmap_buf, &qpmap_info);
@@ -1196,6 +1278,16 @@ gst_vvas_xlookahead_postproc_loop (gpointer data)
 
         lameta->qpmap = qpmap_buf;
         lameta->rc_fsfa = fsfa_buf;
+        if (priv->dynamic_gop) {
+	  if (!((priv->frame_num - vqInfo.frame_num) < XLNX_DYNAMIC_GOP_INTERVAL)) {
+            lameta->num_bframes =
+                priv->bframes[(vqInfo.frame_num / XLNX_DYNAMIC_GOP_INTERVAL) %
+                XLNX_DYNAMIC_GOP_CACHE];
+	    priv->num_bframes = lameta->num_bframes;
+	  } else {
+            lameta->num_bframes =priv->num_bframes;
+	  }
+	}
 
 #ifdef DUMP_LA_META
         {
@@ -1220,7 +1312,8 @@ gst_vvas_xlookahead_postproc_loop (gpointer data)
               GST_ERROR_OBJECT (self, "failed to map fsfa_buf buffer!");
               priv->last_fret = GST_FLOW_ERROR;
               GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
-                  ("failed to map fsfa buffer."), ("failed to map fsfa buffer"));
+                  ("failed to map fsfa buffer."),
+                  ("failed to map fsfa buffer"));
               gst_buffer_unref (fsfa_buf);
               continue;
             }
@@ -1229,7 +1322,7 @@ gst_vvas_xlookahead_postproc_loop (gpointer data)
           }
         }
 #endif
-        
+
         GST_LOG_OBJECT (self,
             "pushing buffer %" GST_PTR_FORMAT
             " with qpmap buffer %p and fsfa buffer %p", inbuf, lameta->qpmap,
@@ -1261,11 +1354,11 @@ gst_vvas_xlookahead_postproc_loop (gpointer data)
       }
     } while (EXlnxSuccess == algo_status);
 
-send_eos:
+  send_eos:
     if (eos_event) {
       gboolean bret;
 
-      GST_INFO_OBJECT (self, "pushing event %"GST_PTR_FORMAT, eos_event);
+      GST_INFO_OBJECT (self, "pushing event %" GST_PTR_FORMAT, eos_event);
 
       bret = gst_pad_push_event (GST_BASE_TRANSFORM_SRC_PAD (self), eos_event);
       if (!bret) {
@@ -1288,23 +1381,15 @@ gst_vvas_xlookahead_start (GstBaseTransform * trans)
   GstVvas_XLookAheadPrivate *priv = self->priv;
 
   gst_video_info_init (priv->in_vinfo);
-  priv->frame_num=0;
+  priv->frame_num = 0;
   priv->is_first_frame = TRUE;
-
-  if (priv->lookahead_depth > priv->gop_size) {
-    GST_ERROR_OBJECT (self, "invalid parameters : lookahead depth %d is "
-        "greater than gop size %d", priv->lookahead_depth, priv->gop_size);
-    GST_ELEMENT_ERROR (self, LIBRARY, SETTINGS,
-        ("lookahead depth is greater than gop size"), NULL);
-    return FALSE;
-  }
 
   if (!priv->lookahead_depth) {
     GST_ERROR_OBJECT (self, "lookahead-depth property is not set or zero."
         "valid range 1 to %d", XLNX_MAX_LOOKAHEAD_DEPTH);
     GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, (NULL),
         ("lookahead-depth property is not set or zero. valid range 1 to %d",
-           XLNX_MAX_LOOKAHEAD_DEPTH));
+            XLNX_MAX_LOOKAHEAD_DEPTH));
     return FALSE;
   }
 
@@ -1314,8 +1399,6 @@ gst_vvas_xlookahead_start (GstBaseTransform * trans)
         ("kernel name is not set"));
     return FALSE;
   }
-
-
 #ifdef ENABLE_XRM_SUPPORT
   priv->xrm_ctx = xrmCreateContext (XRM_API_VERSION_1);
   if (priv->xrm_ctx == NULL) {
@@ -1338,9 +1421,9 @@ gst_vvas_xlookahead_start (GstBaseTransform * trans)
   /* start thread to process statsbuf &
    * attach Adaptive quantization info as metadata to input buffer */
   priv->postproc_thread = g_thread_new ("lookahead-postprocess",
-          gst_vvas_xlookahead_postproc_loop, self);
+      gst_vvas_xlookahead_postproc_loop, self);
 
-  if(priv->enabled_pipeline) {
+  if (priv->enabled_pipeline) {
     priv->copy_inqueue =
         g_async_queue_new_full (vvas_xlookahead_copy_object_unref);
     priv->copy_outqueue =
@@ -1349,7 +1432,6 @@ gst_vvas_xlookahead_start (GstBaseTransform * trans)
     priv->input_copy_thread = g_thread_new ("la-input-copy-thread",
         vvas_xlookahead_input_copy_thread, self);
   }
-
 #ifdef DUMP_LA_META
   qp_fp = fopen ("/tmp/vvas_qpmap.dmp", "w+");
   fsfa_fp = fopen ("/tmp/vvas_fsfamap.dmp", "w+");
@@ -1359,7 +1441,7 @@ gst_vvas_xlookahead_start (GstBaseTransform * trans)
 }
 
 static void
-vvas_xlookahead_free_allocated_pools (GstVvas_XLookAhead *self)
+vvas_xlookahead_free_allocated_pools (GstVvas_XLookAhead * self)
 {
   GstVvas_XLookAheadPrivate *priv = self->priv;
 
@@ -1443,7 +1525,7 @@ gst_vvas_xlookahead_stop (GstBaseTransform * trans)
     priv->ert_cmd_buf = NULL;
   }
 
-  vvas_xlookahead_free_allocated_pools(self);
+  vvas_xlookahead_free_allocated_pools (self);
 
   /* destroy xrm context */
   vvas_xlookahead_destroy_context (self);
@@ -1467,7 +1549,7 @@ gst_vvas_xlookahead_stop (GstBaseTransform * trans)
   g_mutex_clear (&priv->proc_lock);
   g_cond_clear (&priv->proc_cond);
 
-  if(priv->enabled_pipeline) {
+  if (priv->enabled_pipeline) {
     if (priv->input_copy_thread) {
       g_async_queue_push (priv->copy_inqueue, STOP_COMMAND);
       GST_LOG_OBJECT (self, "waiting for copy input thread join");
@@ -1476,12 +1558,12 @@ gst_vvas_xlookahead_stop (GstBaseTransform * trans)
     }
 
     if (priv->copy_inqueue) {
-      g_async_queue_unref(priv->copy_inqueue);
+      g_async_queue_unref (priv->copy_inqueue);
       priv->copy_inqueue = NULL;
     }
 
     if (priv->copy_outqueue) {
-      g_async_queue_unref(priv->copy_outqueue);
+      g_async_queue_unref (priv->copy_outqueue);
       priv->copy_outqueue = NULL;
     }
   }
@@ -1504,7 +1586,7 @@ vvas_xlookahead_init_core (GstVvas_XLookAhead * self, guint in_width,
   aq_config_t *qpmapcfg = NULL;
   guint actual_mb_w, actual_mb_h;
   size_t length;
-  guint qpmap_size;
+  guint qpmap_size, idx;
   xlnx_aq_dump_cfg dumpCfg;
   gboolean bret = FALSE;
 
@@ -1518,6 +1600,27 @@ vvas_xlookahead_init_core (GstVvas_XLookAhead * self, guint in_width,
     GST_ERROR_OBJECT (self, "Invalid params: temporal AQ can't be enabled "
         " with lookahead depth = 0");
     return FALSE;
+  }
+
+  if (priv->dynamic_gop) {
+    if (priv->lookahead_depth < DYNAMIC_GOP_MIN_LOOKAHEAD_DEPTH) {
+      GST_ELEMENT_ERROR (self, LIBRARY, SETTINGS, NULL,
+          ("Lookahead depth should be atleast %d when dynamic-gop is enabled",
+              DYNAMIC_GOP_MIN_LOOKAHEAD_DEPTH));
+      GST_ERROR_OBJECT (self,
+          "Lookahead depth should be atleast %d when dynamic-gop is enabled",
+          DYNAMIC_GOP_MIN_LOOKAHEAD_DEPTH);
+      return FALSE;
+    }
+  }
+
+  for (idx = 0; idx < XLNX_DYNAMIC_GOP_CACHE; idx++) {
+    priv->bframes[idx] = priv->num_bframes;
+  }
+
+  /* if not specified by user, set min-qp to 20 as this gives better performance */
+  if (!priv->min_qp) {
+    priv->min_qp = 20;
   }
 
   out_width = XLNX_ALIGN ((in_width), 64) >> SCLEVEL1;
@@ -1597,6 +1700,8 @@ gst_vvas_xlookahead_set_caps (GstBaseTransform * trans, GstCaps * incaps,
   GstVideoInfo vinfo;
   guint in_width, in_height, in_stride, in_bit_depth;
   gint iret;
+  GstQuery *enc_query;
+  GstStructure *qstruct;
 #ifdef ENABLE_XRM_SUPPORT
   gint load;
 
@@ -1620,6 +1725,81 @@ gst_vvas_xlookahead_set_caps (GstBaseTransform * trans, GstCaps * incaps,
     return FALSE;
   }
 
+  qstruct = gst_structure_new (VVAS_ENCODER_QUERY_NAME,
+      "gop-length", G_TYPE_UINT, 0,
+      "ultra-low-latency", G_TYPE_BOOLEAN, FALSE,
+      "rc-mode", G_TYPE_BOOLEAN, FALSE, NULL);
+  enc_query = gst_query_new_custom (GST_QUERY_CUSTOM, qstruct);
+  bret = gst_pad_query (trans->sinkpad, enc_query);
+  if (bret) {
+    const GstStructure *mod_qstruct = gst_query_get_structure (enc_query);
+
+    bret = gst_structure_get_uint (mod_qstruct, "gop-length", &priv->gop_size);
+    if (!bret) {
+      GST_ERROR_OBJECT (self, "failed to get gop-size from query");
+      gst_query_unref (enc_query);
+      return FALSE;
+    }
+    GST_INFO_OBJECT (self, "received gop-size %u from downstream",
+        priv->gop_size);
+
+    bret =
+        gst_structure_get_boolean (mod_qstruct, "ultra-low-latency",
+        &priv->ultra_low_latency);
+    if (!bret) {
+      GST_ERROR_OBJECT (self, "failed to get ultra-low-latency from query");
+      gst_query_unref (enc_query);
+      return FALSE;
+    }
+    GST_INFO_OBJECT (self, "received ultra-low-latency %u from downstream",
+        priv->ultra_low_latency);
+
+    bret =
+        gst_structure_get_boolean (mod_qstruct, "rc-mode",
+        &priv->enable_rate_control);
+    if (!bret) {
+      GST_ERROR_OBJECT (self, "failed to get rate-control from query");
+      gst_query_unref (enc_query);
+      return FALSE;
+    }
+    GST_INFO_OBJECT (self, "received rc-mode %u from downstream",
+        priv->enable_rate_control);
+  } else {
+    GST_ERROR_OBJECT (self, "failed to send custom query");
+    gst_query_unref (enc_query);
+    return FALSE;
+  }
+  gst_query_unref (enc_query);
+
+  if (priv->dynamic_gop && (priv->num_bframes != UNSET_NUM_B_FRAMES)) {
+    GST_ELEMENT_ERROR (self, LIBRARY, SETTINGS, NULL,
+        ("dynamic gop is enabled, b-frames cannot be set"));
+    return FALSE;
+  }
+
+  if (priv->ultra_low_latency && (priv->num_bframes == UNSET_NUM_B_FRAMES)) {
+    priv->num_bframes = 0;
+    GST_DEBUG_OBJECT (self,
+        "setting b-frames to 0 as ultra-low-latency mode is enabled");
+  }
+
+  priv->num_bframes =
+      priv->num_bframes ==
+      UNSET_NUM_B_FRAMES ? DEFAULT_NUM_B_FRAMES : priv->num_bframes;
+
+  if (priv->lookahead_depth > priv->gop_size) {
+    GST_ERROR_OBJECT (self, "invalid parameters : lookahead depth %d is "
+        "greater than gop size %d", priv->lookahead_depth, priv->gop_size);
+    GST_ELEMENT_ERROR (self, LIBRARY, SETTINGS,
+        ("lookahead depth is greater than gop size"), NULL);
+    return FALSE;
+  }
+
+  if (priv->num_bframes && priv->ultra_low_latency) {
+    GST_ELEMENT_ERROR (self, LIBRARY, SETTINGS, NULL,
+        ("b-frames cannot be encoded in ultra-low-latency mode"));
+    return FALSE;
+  }
 #ifdef ENABLE_XRM_SUPPORT
   bret = vvas_xlookahead_calculate_load (self, &load, &vinfo);
   if (!bret) {
@@ -1639,7 +1819,7 @@ gst_vvas_xlookahead_set_caps (GstBaseTransform * trans, GstCaps * incaps,
   }
 
   if (!priv->ert_cmd_buf) {
-    uint32_t write_mv = 0;        /* currently always zero */
+    uint32_t write_mv = 1;
 
     priv->ert_cmd_buf = (xrt_buffer *) calloc (1, sizeof (xrt_buffer));
     if (priv->ert_cmd_buf == NULL) {
@@ -1657,14 +1837,14 @@ gst_vvas_xlookahead_set_caps (GstBaseTransform * trans, GstCaps * incaps,
 
     memset (priv->ert_cmd_buf->user_ptr, 0x0, ERT_CMD_SIZE);
 
-    vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_WRITE_MV_DATA, &write_mv,
-        sizeof (uint32_t));
+    vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_WRITE_MV_DATA,
+        &write_mv, sizeof (uint32_t));
   }
 
   in_width = GST_VIDEO_INFO_WIDTH (&vinfo);
   in_height = GST_VIDEO_INFO_HEIGHT (&vinfo);
   in_stride = GST_VIDEO_INFO_PLANE_STRIDE (&vinfo, 0);
-  in_bit_depth = GST_VIDEO_INFO_COMP_DEPTH(&vinfo, 0);
+  in_bit_depth = GST_VIDEO_INFO_COMP_DEPTH (&vinfo, 0);
 
   if ((GST_VIDEO_INFO_WIDTH (self->priv->in_vinfo) != in_width) &&
       (GST_VIDEO_INFO_HEIGHT (self->priv->in_vinfo) != in_height) &&
@@ -1692,16 +1872,16 @@ gst_vvas_xlookahead_set_caps (GstBaseTransform * trans, GstCaps * incaps,
         skip_l2 = 1;
       }
 
-      vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_WIDTH_DATA, &in_width,
-          sizeof (uint32_t));
-      vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_HEIGHT_DATA, &in_height,
-          sizeof (uint32_t));
-      vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_STRIDE_DATA, &in_stride,
-          sizeof (uint32_t));
-      vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_SKIP_L2_DATA, &skip_l2,
-          sizeof (uint32_t));
-      vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_PIXFMT_DATA, &pixel_fmt,
-          sizeof (uint32_t));
+      vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_WIDTH_DATA,
+          &in_width, sizeof (uint32_t));
+      vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_HEIGHT_DATA,
+          &in_height, sizeof (uint32_t));
+      vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_STRIDE_DATA,
+          &in_stride, sizeof (uint32_t));
+      vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_SKIP_L2_DATA,
+          &skip_l2, sizeof (uint32_t));
+      vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_PIXFMT_DATA,
+          &pixel_fmt, sizeof (uint32_t));
 
       bret = vvas_xlookahead_init_core (self, in_width, in_height);
       if (!bret)
@@ -1737,19 +1917,24 @@ gst_vvas_xlookahead_query (GstBaseTransform * trans, GstPadDirection direction,
   GstVvas_XLookAhead *self = GST_VVAS_XLOOKAHEAD (trans);
 
   switch (GST_QUERY_TYPE (query)) {
-    case GST_QUERY_CUSTOM: {
+    case GST_QUERY_CUSTOM:{
       GstStructure *qstruct = NULL;
 
       GST_DEBUG_OBJECT (self, "received CUSTOM query");
 
       qstruct = gst_query_writable_structure (query);
-      if (qstruct && !g_strcmp0(gst_structure_get_name (qstruct),
-          VVAS_LOOKAHEAD_QUERY_NAME)) {
+      if (qstruct && !g_strcmp0 (gst_structure_get_name (qstruct),
+              VVAS_LOOKAHEAD_QUERY_NAME)) {
         gst_structure_set (qstruct,
             "la-depth", G_TYPE_UINT, self->priv->lookahead_depth,
-            "rc-mode", G_TYPE_BOOLEAN, self->priv->enable_rate_control, NULL);
+            "dynamic-gop", G_TYPE_BOOLEAN, self->priv->dynamic_gop,
+            "b-frames", G_TYPE_INT, self->priv->num_bframes, NULL);
         GST_INFO_OBJECT (self, "updating lookahead depth %u in query",
             self->priv->lookahead_depth);
+        GST_INFO_OBJECT (self, "updating dynamic-gop %u in query",
+            self->priv->dynamic_gop);
+        GST_INFO_OBJECT (self, "updating b-frames %d in query",
+            self->priv->num_bframes);
         return TRUE;
       }
     }
@@ -1757,7 +1942,8 @@ gst_vvas_xlookahead_query (GstBaseTransform * trans, GstPadDirection direction,
       break;
   }
 
-  return GST_BASE_TRANSFORM_CLASS (parent_class)->query (trans, direction, query);
+  return GST_BASE_TRANSFORM_CLASS (parent_class)->query (trans, direction,
+      query);
 }
 
 static gboolean
@@ -1814,8 +2000,8 @@ gst_vvas_xlookahead_sink_event (GstBaseTransform * trans, GstEvent * event)
 }
 
 static gboolean
-vvas_xlookahead_copy_input_buffer (GstVvas_XLookAhead * self, GstBuffer **inbuf,
-    GstBuffer ** internal_inbuf)
+vvas_xlookahead_copy_input_buffer (GstVvas_XLookAhead * self,
+    GstBuffer ** inbuf, GstBuffer ** internal_inbuf)
 {
   GstVvas_XLookAheadPrivate *priv = self->priv;
   GstBuffer *new_inbuf;
@@ -1873,14 +2059,14 @@ vvas_xlookahead_copy_input_buffer (GstVvas_XLookAhead * self, GstBuffer **inbuf,
 
     /* map internal buffer in write mode */
     if (!gst_video_frame_map (&new_vframe, self->priv->in_vinfo, new_inbuf,
-        GST_MAP_WRITE)) {
+            GST_MAP_WRITE)) {
       GST_ERROR_OBJECT (self, "failed to map internal input buffer");
       goto error;
     }
 
     /* map input buffer in read mode */
     if (!gst_video_frame_map (&in_vframe, self->priv->in_vinfo, *inbuf,
-        GST_MAP_READ)) {
+            GST_MAP_READ)) {
       GST_ERROR_OBJECT (self, "failed to map input buffer");
       goto error;
     }
@@ -1983,16 +2169,15 @@ gst_vvas_xlookahead_submit_input_buffer (GstBaseTransform * trans,
   if (vmeta) {
     /* update stride from videometa */
     uint32_t stride = vmeta->stride[0];
-    vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_STRIDE_DATA, &stride,
-        sizeof (uint32_t));
+    vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_STRIDE_DATA,
+        &stride, sizeof (uint32_t));
   }
 
   bret = gst_vvas_memory_sync_bo (in_mem);
   if (!bret) {
     GST_ERROR_OBJECT (self, "failed to sync data");
     GST_ELEMENT_ERROR (self, RESOURCE, SYNC, NULL,
-        ("failed to sync memory to device. reason : %s",
-            strerror (errno)));
+        ("failed to sync memory to device. reason : %s", strerror (errno)));
     goto error;
   }
 
@@ -2039,22 +2224,23 @@ gst_vvas_xlookahead_submit_input_buffer (GstBaseTransform * trans,
     goto error;
   }
 
-  vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_FRM_BUFFER_SRCH_V_DATA,
-      &prev_in_paddr, sizeof (uint64_t));
-  vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_FRM_BUFFER_REF_V_DATA, &in_paddr,
+  vvas_xlookahead_register_write (self,
+      XV_MOT_EST_CTRL_ADDR_FRM_BUFFER_SRCH_V_DATA, &prev_in_paddr,
       sizeof (uint64_t));
-  vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_SAD_V_DATA, &stats_paddr,
-      sizeof (uint64_t));
+  vvas_xlookahead_register_write (self,
+      XV_MOT_EST_CTRL_ADDR_FRM_BUFFER_REF_V_DATA, &in_paddr, sizeof (uint64_t));
+  vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_SAD_V_DATA,
+      &stats_paddr, sizeof (uint64_t));
 
   mv_paddr = stats_paddr + priv->mv_off;
-  vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_MV_V_DATA, &mv_paddr,
-      sizeof (uint64_t));
+  vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_MV_V_DATA,
+      &mv_paddr, sizeof (uint64_t));
   var_paddr = stats_paddr + priv->var_off;
-  vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_VAR_V_DATA, &var_paddr,
-      sizeof (uint64_t));
+  vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_VAR_V_DATA,
+      &var_paddr, sizeof (uint64_t));
   act_paddr = stats_paddr + priv->act_off;
-  vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_ACT_V_DATA, &act_paddr,
-      sizeof (uint64_t));
+  vvas_xlookahead_register_write (self, XV_MOT_EST_CTRL_ADDR_ACT_V_DATA,
+      &act_paddr, sizeof (uint64_t));
 
   /* prepare ert command */
   ert_cmd->state = ERT_CMD_STATE_NEW;
@@ -2104,7 +2290,7 @@ gst_vvas_xlookahead_submit_input_buffer (GstBaseTransform * trans,
   spatial_aq = priv->spatial_aq;
   temporal_aq = priv->temporal_aq;
   spatial_aq_gain = priv->spatial_aq_gain;
-  
+
   /* Update LA meta on input buffer */
   w_inbuf = gst_buffer_make_writable (inbuf);
 
@@ -2122,6 +2308,8 @@ gst_vvas_xlookahead_submit_input_buffer (GstBaseTransform * trans,
   lameta->spatial_aq = spatial_aq;
   lameta->temporal_aq = temporal_aq;
   lameta->spatial_aq_gain = spatial_aq_gain;
+  lameta->min_qp = priv->min_qp;
+  lameta->max_qp = priv->max_qp;
 
   /* Update LA meta on stats buffer */
   w_stats_buf = gst_buffer_make_writable (stats_buf);
@@ -2140,7 +2328,9 @@ gst_vvas_xlookahead_submit_input_buffer (GstBaseTransform * trans,
   lameta->spatial_aq = spatial_aq;
   lameta->temporal_aq = temporal_aq;
   lameta->spatial_aq_gain = spatial_aq_gain;
-  
+  lameta->min_qp = priv->min_qp;
+  lameta->max_qp = priv->max_qp;
+
   priv->is_idr = FALSE;
   g_mutex_lock (&priv->proc_lock);
   g_queue_push_tail (priv->inbuf_queue, w_inbuf);
@@ -2202,21 +2392,16 @@ gst_vvas_xlookahead_class_init (GstVvas_XLookAheadClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_DEVICE_INDEX,
       g_param_spec_int ("dev-idx", "Device index",
-          "Valid Device index is 0 to 31. Default value is set to -1 intentionally so that user provides the correct device index.", -1 , 31,
-          DEFAULT_DEVICE_INDEX,
+          "Valid Device index is 0 to 31. Default value is set to -1 intentionally so that user provides the correct device index.",
+          -1, 31, DEFAULT_DEVICE_INDEX,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
           GST_PARAM_MUTABLE_READY));
 
-  g_object_class_install_property (gobject_class, PROP_GOP_LENGTH,
-      g_param_spec_uint ("gop-length", "GOP length",
-          "Number of frames between consecutive keyframes", 0, 256,
-          DEFAULT_GOP_SIZE, G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY |
-          G_PARAM_STATIC_STRINGS));
-
   g_object_class_install_property (gobject_class, PROP_NUM_BFRAMES,
-      g_param_spec_uint ("b-frames", "Number of B frames",
-          "Number of B-frames between two consecutive P-frames",
-          0, G_MAXUINT, DEFAULT_NUM_B_FRAMES,
+      g_param_spec_int ("b-frames", "Number of B frames",
+          "Number of B-frames between two consecutive P-frames. "
+          "By default, internally set to 0 for ultra-low-latency mode, 2 otherwise if not configured or configured with -1",
+          -1, G_MAXINT, UNSET_NUM_B_FRAMES,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   g_object_class_install_property (gobject_class, PROP_SPATIAL_AQ,
@@ -2227,11 +2412,6 @@ gst_vvas_xlookahead_class_init (GstVvas_XLookAheadClass * klass)
   g_object_class_install_property (gobject_class, PROP_TEMPORAL_AQ,
       g_param_spec_boolean ("temporal-aq", "Temporal AQ",
           "Enable/Disable Temporal AQ linear", DEFAULT_TEMPORAL_AQ,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
-  g_object_class_install_property (gobject_class, PROP_ENABLE_RATE_CONTROL,
-      g_param_spec_boolean ("rc-mode", "Custom Rate control on/off",
-          "Enable or disable Custom rate control", DEFAULT_RATE_CONTROL,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   g_object_class_install_property (gobject_class, PROP_SPATIAL_AQ_GAIN,
@@ -2245,12 +2425,14 @@ gst_vvas_xlookahead_class_init (GstVvas_XLookAheadClass * klass)
           "Lookahead depth", 1, XLNX_MAX_LOOKAHEAD_DEPTH,
           DEFAULT_LOOK_AHEAD_DEPTH,
           G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY |
-          G_PARAM_STATIC_STRINGS ));
+          G_PARAM_STATIC_STRINGS));
 
+#ifndef ENABLE_XRM_SUPPORT
   g_object_class_install_property (gobject_class, PROP_XCLBIN_LOCATION,
       g_param_spec_string ("xclbin-location", "xclbin file location",
           "Location of the xclbin to program device", NULL,
           G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
+#endif
 
   g_object_class_install_property (gobject_class, PROP_CODEC_TYPE,
       g_param_spec_enum ("codec-type", "Codec type H264/H265",
@@ -2260,7 +2442,7 @@ gst_vvas_xlookahead_class_init (GstVvas_XLookAheadClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_KERNEL_NAME,
       g_param_spec_string ("kernel-name", "Lookahead kernel name",
-	      "Lookahead kernel name", VVAS_LOOKAHEAD_KERNEL_NAME_DEFAULT,
+          "Lookahead kernel name", VVAS_LOOKAHEAD_KERNEL_NAME_DEFAULT,
           G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
 
   g_object_class_install_property (gobject_class, PROP_ENABLE_PIPELINE,
@@ -2268,6 +2450,27 @@ gst_vvas_xlookahead_class_init (GstVvas_XLookAheadClass * klass)
           "Enable pipelining",
           "Enable buffer pipelining to improve performance in non zero-copy use cases",
           VVAS_LOOKAHEAD_DEFAULT_ENABLE_PIPLINE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_READY));
+
+  g_object_class_install_property (gobject_class, PROP_DYNAMIC_GOP,
+      g_param_spec_boolean ("dynamic-gop", "Enable dynamic GOP",
+          "Automatically change B-frame structure based on motion vectors. Requires Lookahead depth of at least 5",
+          VVAS_LOOKAHEAD_DEFAULT_DYNAMIC_GOP,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_READY));
+
+  g_object_class_install_property (gobject_class, PROP_MAX_QP,
+      g_param_spec_uint ("max-qp", "max Quantization value",
+          "Maximum QP value allowed for the rate control",
+          0, 51, DEFAULT_MAX_QP,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_READY));
+
+  g_object_class_install_property (gobject_class, PROP_MIN_QP,
+      g_param_spec_uint ("min-qp", "min Quantization value",
+          "Minimum QP value allowed for the rate control",
+          0, 51, DEFAULT_MIN_QP,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
           GST_PARAM_MUTABLE_READY));
 
@@ -2319,7 +2522,7 @@ gst_vvas_xlookahead_init (GstVvas_XLookAhead * self)
   priv->temporal_aq = DEFAULT_TEMPORAL_AQ;
   priv->enable_rate_control = DEFAULT_RATE_CONTROL;
   priv->spatial_aq_gain = DEFAULT_SPATIAL_AQ_GAIN_PERCENT;
-  priv->num_bframes = DEFAULT_NUM_B_FRAMES;
+  priv->num_bframes = UNSET_NUM_B_FRAMES;
   priv->prev_inbuf = NULL;
   priv->num_mb = 0;
   priv->frame_num = 0;
@@ -2333,6 +2536,8 @@ gst_vvas_xlookahead_init (GstVvas_XLookAhead * self)
   priv->has_error = FALSE;
   priv->enabled_pipeline = VVAS_LOOKAHEAD_DEFAULT_ENABLE_PIPLINE;
   priv->stop = FALSE;
+  priv->min_qp = DEFAULT_MIN_QP;
+  priv->max_qp = DEFAULT_MAX_QP;
 
 #ifdef ENABLE_XRM_SUPPORT
   priv->xrm_ctx = NULL;
@@ -2361,9 +2566,6 @@ gst_vvas_xlookahead_set_property (GObject * object, guint prop_id,
 
       self->priv->xclbin_path = g_value_dup_string (value);
       break;
-    case PROP_GOP_LENGTH:
-      self->priv->gop_size = g_value_get_uint (value);
-      break;
     case PROP_LOOKAHEAD_DEPTH:
       self->priv->lookahead_depth = g_value_get_uint (value);
       break;
@@ -2372,9 +2574,6 @@ gst_vvas_xlookahead_set_property (GObject * object, guint prop_id,
       break;
     case PROP_TEMPORAL_AQ:
       self->priv->temporal_aq = g_value_get_boolean (value);
-      break;
-    case PROP_ENABLE_RATE_CONTROL:
-      self->priv->enable_rate_control = g_value_get_boolean (value);
       break;
     case PROP_SPATIAL_AQ_GAIN:
       self->priv->spatial_aq_gain = g_value_get_uint (value);
@@ -2389,10 +2588,42 @@ gst_vvas_xlookahead_set_property (GObject * object, guint prop_id,
       self->priv->kernel_name = g_value_dup_string (value);
       break;
     case PROP_NUM_BFRAMES:
-      self->priv->num_bframes = g_value_get_uint (value);
+      GST_OBJECT_LOCK (self);
+      if (GST_STATE (self) == GST_STATE_NULL
+          || GST_STATE (self) == GST_STATE_READY) {
+        self->priv->num_bframes = g_value_get_int (value);
+      } else if (GST_STATE (self) > GST_STATE_READY) {
+        if (!self->priv->ultra_low_latency && !self->priv->dynamic_gop) {
+          self->priv->num_bframes = g_value_get_int (value);
+        } else {
+          if (self->priv->ultra_low_latency) {
+            GST_WARNING_OBJECT (self,
+                "Dynamic configuration of b-frames is not supported"
+                "in ultra-low-latency mode");
+          } else if (self->priv->dynamic_gop) {
+            GST_WARNING_OBJECT (self,
+                "Dynamic configuration of b-frames is not supported"
+                "when dynamic GOP is enabled");
+          }
+        }
+      }
+      GST_OBJECT_UNLOCK (self);
       break;
     case PROP_ENABLE_PIPELINE:
       self->priv->enabled_pipeline = g_value_get_boolean (value);
+      break;
+    case PROP_DYNAMIC_GOP:
+      self->priv->dynamic_gop = g_value_get_boolean (value);
+      break;
+    case PROP_MIN_QP:
+      GST_OBJECT_LOCK (self);
+      self->priv->min_qp = g_value_get_uint (value);
+      GST_OBJECT_UNLOCK (self);
+      break;
+    case PROP_MAX_QP:
+      GST_OBJECT_LOCK (self);
+      self->priv->max_qp = g_value_get_uint (value);
+      GST_OBJECT_UNLOCK (self);
       break;
 #ifdef ENABLE_XRM_SUPPORT
     case PROP_RESERVATION_ID:
@@ -2415,9 +2646,6 @@ gst_vvas_xlookahead_get_property (GObject * object, guint prop_id,
     case PROP_DEVICE_INDEX:
       g_value_set_int (value, self->priv->dev_idx);
       break;
-    case PROP_GOP_LENGTH:
-      g_value_set_uint (value, self->priv->gop_size);
-      break;
     case PROP_LOOKAHEAD_DEPTH:
       g_value_set_uint (value, self->priv->lookahead_depth);
       break;
@@ -2427,9 +2655,6 @@ gst_vvas_xlookahead_get_property (GObject * object, guint prop_id,
     case PROP_TEMPORAL_AQ:
       g_value_set_boolean (value, self->priv->temporal_aq);
       break;
-    case PROP_ENABLE_RATE_CONTROL:
-      g_value_set_boolean (value, self->priv->enable_rate_control);
-      break;
     case PROP_SPATIAL_AQ_GAIN:
       g_value_set_uint (value, self->priv->spatial_aq_gain);
       break;
@@ -2437,10 +2662,19 @@ gst_vvas_xlookahead_get_property (GObject * object, guint prop_id,
       g_value_set_enum (value, self->priv->codec_type);
       break;
     case PROP_NUM_BFRAMES:
-      g_value_set_uint (value, self->priv->num_bframes);
+      g_value_set_int (value, self->priv->num_bframes);
       break;
     case PROP_ENABLE_PIPELINE:
       g_value_set_boolean (value, self->priv->enabled_pipeline);
+      break;
+    case PROP_DYNAMIC_GOP:
+      g_value_set_boolean (value, self->priv->dynamic_gop);
+      break;
+    case PROP_MIN_QP:
+      g_value_set_uint (value, self->priv->min_qp);
+      break;
+    case PROP_MAX_QP:
+      g_value_set_uint (value, self->priv->max_qp);
       break;
 #ifdef ENABLE_XRM_SUPPORT
     case PROP_RESERVATION_ID:

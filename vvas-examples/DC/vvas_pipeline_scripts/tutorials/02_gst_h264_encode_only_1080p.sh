@@ -33,7 +33,8 @@ if [ $# -lt 3 ]; then
      echo ""
      echo "Maximum 4 instances if each output is 1080p60"
      echo "Ex: $0 0 Test_1920x1080p60.nv12 4 0 0"
-     echo "NOTE: For input raw strem resolutions other than 1080p, change width, height and framerate params in the script accordingly"
+     echo "NOTE: For input raw strem resolutions other than 1080p, change width, height, blocksize and framerate params in the script accordingly"
+     echo "NOTE: blocksize is the size of one frame in bytes"
      exit 1
 fi
 

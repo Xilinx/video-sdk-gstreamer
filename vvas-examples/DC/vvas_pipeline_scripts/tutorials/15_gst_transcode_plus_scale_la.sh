@@ -163,7 +163,7 @@ pipe="gst-launch-1.0 filesrc num-buffers=$num location=$input_file
 		! queue
 		! videorate
 		! video/x-raw, framerate=60/1
-		! vvas_xlookahead  codec-type=0 spatial-aq=1 temporal-aq=1 lookahead-depth=8 rc-mode=1 dev-idx=$di
+		! vvas_xlookahead  codec-type=0 spatial-aq=1 temporal-aq=1 lookahead-depth=8 dev-idx=$di
 		! vvas_xvcuenc name=$enc_720p60 dev-idx=$di  target-bitrate=4000 rc-mode=1
 		! h264parse
 		${muxer}
@@ -172,7 +172,7 @@ pipe="gst-launch-1.0 filesrc num-buffers=$num location=$input_file
 		! queue
 		! videorate
 		! video/x-raw, framerate=30/1
-		! vvas_xlookahead  codec-type=0 spatial-aq=1 temporal-aq=1 lookahead-depth=8 rc-mode=1 dev-idx=$di
+		! vvas_xlookahead  codec-type=0 spatial-aq=1 temporal-aq=1 lookahead-depth=8 dev-idx=$di
 		! vvas_xvcuenc name=$enc_720p30 dev-idx=$di  target-bitrate=3000 rc-mode=1
 		! h264parse
 		${muxer}
@@ -182,7 +182,7 @@ pipe="gst-launch-1.0 filesrc num-buffers=$num location=$input_file
 	    ! video/x-raw, width=848, height=480
 	    ! videorate
 	    ! video/x-raw, framerate=30/1
-	    ! vvas_xlookahead  codec-type=0 spatial-aq=1 temporal-aq=1 lookahead-depth=8 rc-mode=1 dev-idx=$di
+	    ! vvas_xlookahead  codec-type=0 spatial-aq=1 temporal-aq=1 lookahead-depth=8 dev-idx=$di
 	    ! vvas_xvcuenc name=$enc_480p30 dev-idx=$di  target-bitrate=2500 rc-mode=1
 	    ! h264parse
 	    ${muxer}
@@ -192,7 +192,7 @@ pipe="gst-launch-1.0 filesrc num-buffers=$num location=$input_file
 	    ! video/x-raw, width=640, height=360
 	    ! videorate
 	    ! video/x-raw, framerate=30/1
-	    ! vvas_xlookahead  codec-type=0 spatial-aq=1 temporal-aq=1 lookahead-depth=8 rc-mode=1 dev-idx=$di
+	    ! vvas_xlookahead  codec-type=0 spatial-aq=1 temporal-aq=1 lookahead-depth=8 dev-idx=$di
 	    ! vvas_xvcuenc name=$enc_360p30 dev-idx=$di  target-bitrate=1250 rc-mode=1
 	    ! h264parse
 	    ${muxer}
@@ -202,7 +202,7 @@ pipe="gst-launch-1.0 filesrc num-buffers=$num location=$input_file
 	    ! video/x-raw, width=288, height=160
 	    ! videorate
 	    ! video/x-raw, framerate=30/1
-	    ! vvas_xlookahead  codec-type=0 spatial-aq=1 temporal-aq=1 lookahead-depth=8 rc-mode=1 dev-idx=$di
+	    ! vvas_xlookahead  codec-type=0 spatial-aq=1 temporal-aq=1 lookahead-depth=8 dev-idx=$di
 	    ! vvas_xvcuenc name=$enc_160p30 dev-idx=$di  target-bitrate=625 rc-mode=1
 	    ! h264parse
 	    ${muxer}

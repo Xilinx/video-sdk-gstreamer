@@ -41,6 +41,8 @@ struct _GstVvasLAMeta {
   gboolean spatial_aq;
   gboolean temporal_aq;
   guint spatial_aq_gain;
+  guint min_qp;
+  guint max_qp;
 
   GstBuffer *qpmap;
   GstBuffer *rc_fsfa;

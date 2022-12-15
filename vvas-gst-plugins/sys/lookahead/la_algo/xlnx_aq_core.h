@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2019, Xilinx Inc - All rights reserved
- * Xilinx Lookahead XMA Plugin
+ * Xilinx Lookahead Plugin
  *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
  * not use this file except in compliance with the License. A copy of the
@@ -52,11 +52,16 @@ typedef struct xlnx_aq_dump_cfg
 xlnx_aq_core_t create_aq_core(aq_config_t *cfg, xlnx_aq_dump_cfg *dumpCfg);
 void update_aq_modes(xlnx_aq_core_t handle, aq_config_t *cfg);
 void destroy_aq_core(xlnx_aq_core_t handle);
-xlnx_status send_frame_stats(xlnx_aq_core_t handle, uint64_t frame_num,
+xlnx_status send_frame_stats(xlnx_aq_core_t handle, uint32_t dynamic_gop, uint64_t frame_num,
                              xlnx_frame_stats *stats,
                              uint32_t isLastFrame, int32_t is_idr);
 xlnx_status recv_frame_aq_info(xlnx_aq_core_t handle, xlnx_aq_info_t *vqInfo,
                                uint64_t frame_num, int32_t is_idr);
+
+xlnx_status generate_mv_histogram(xlnx_aq_core_t handle, uint64_t frame_num,
+                                  const uint32_t* mvIn, uint32_t isLastFrame,
+                                  int32_t* frame_complexity, int32_t is_idr);
+void update_num_b_frames(xlnx_aq_core_t handle, aq_config_t* cfg);
 
 #endif //XLNX_AQ_CORE_H
 

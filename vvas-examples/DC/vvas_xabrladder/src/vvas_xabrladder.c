@@ -187,6 +187,14 @@ typedef struct dyn_spatial_aq_gain
   gboolean is_valid;
 } DynamicSpatialAqGain;
 
+typedef struct dyn_min_max_qp
+{
+  int frame_num;
+  int min_qp;
+  int max_qp;
+  gboolean is_valid;
+} DynamicMinMaxQP;
+
 typedef struct dyn_params
 {
   int num_dyn_params;
@@ -195,6 +203,7 @@ typedef struct dyn_params
   DynamicSpatialAq *dyn_spatial_aq_conf;
   DynamicTemporalAq *dyn_temporal_aq_conf;
   DynamicSpatialAqGain *dyn_spatial_aq_gain_conf;
+  DynamicMinMaxQP *dyn_min_max_qp_conf;
 } DynamicParams;
 
 typedef struct output_config
@@ -255,7 +264,6 @@ typedef struct tail
   GstElement *videoratecaps;
   GstElement *lookahead;
   GstElement *encoder;
-  GstElement *encparse;
   GstElement *enccaps;
   GstElement *sink;
 
@@ -318,6 +326,7 @@ typedef struct enc_pad_probe_cb_info
   guint64 frame_count;
   int next_bitrate_index;
   int next_bframe_index;
+  int next_min_max_qp_index;
   CustomData *data_priv;
 }EncPadProbeCbInfo;
 
@@ -329,6 +338,7 @@ typedef struct la_pad_probe_cb_info
   int next_spatial_aq_index;
   int next_temporal_aq_index;
   int next_spatial_aq_gain_index;
+  int next_min_max_qp_index;
   CustomData *data_priv;
 }LaPadProbeCbInfo;
 
@@ -343,7 +353,6 @@ GstElement *create_videoratecaps (CustomData * priv, int num);
 GstElement *create_lookahead (CustomData * priv, int num);
 GstElement *create_encoder (CustomData * priv, int num);
 GstElement *create_enccaps (CustomData * priv, int num);
-GstElement *create_encparse (CustomData * priv, int num);
 GstElement *create_sink (CustomData * priv, int num);
 int get_container_type (const char *path);
 static int get_codec_type (const char *path, CustomData * priv);
@@ -392,8 +401,9 @@ vvas_read_json (json_t *root, CustomData * priv)
   json_t *ladder, *outarray, *output, *value;
   json_t *dyn_params, *dyn_params_array;
   int j, k, frame_num = 0;
-  int dyn_bframe_index = 0, dyn_bitrate_index = 0;
+  int dyn_bframe_index = 0, dyn_bitrate_index = 0, dyn_min_max_qp_index = 0;
   int dyn_spatial_aq_index = 0, dyn_temporal_aq_index = 0, dyn_spatial_aq_gain_index = 0;
+  gboolean dyn_qp_present = FALSE;
 
   /* get log_level */
   value = json_object_get (root, "log-level");
@@ -668,6 +678,7 @@ vvas_read_json (json_t *root, CustomData * priv)
     dyn_spatial_aq_index = 0;
     dyn_temporal_aq_index = 0;
     dyn_spatial_aq_gain_index = 0;
+    dyn_min_max_qp_index = 0;
 
     dyn_params_array = json_object_get (output, "dynamic_params");
     if (dyn_params_array) {
@@ -693,8 +704,11 @@ vvas_read_json (json_t *root, CustomData * priv)
             (DynamicTemporalAq *)calloc(1, priv->largs.outconf[j].dparams.num_dyn_params * sizeof (DynamicTemporalAq));
         priv->largs.outconf[j].dparams.dyn_spatial_aq_gain_conf = 
             (DynamicSpatialAqGain *)calloc(1, priv->largs.outconf[j].dparams.num_dyn_params * sizeof (DynamicSpatialAqGain));
+        priv->largs.outconf[j].dparams.dyn_min_max_qp_conf =
+            (DynamicMinMaxQP *)calloc(1, priv->largs.outconf[j].dparams.num_dyn_params * sizeof (DynamicMinMaxQP));
 
         for (k = 0; k < priv->largs.outconf[j].dparams.num_dyn_params; k++) {
+          dyn_qp_present = FALSE;
           dyn_params = json_array_get (dyn_params_array, k);
           if (!dyn_params) {
             GST_MSG (LOG_LEVEL_ERROR, priv->log_level, "failed to get dyn_params object");
@@ -764,6 +778,32 @@ vvas_read_json (json_t *root, CustomData * priv)
             priv->largs.outconf[j].dparams.dyn_spatial_aq_gain_conf[dyn_spatial_aq_gain_index].is_valid = TRUE;
             dyn_spatial_aq_gain_index++;
           }
+
+          value = json_object_get (dyn_params, "min-qp");
+          if (!value || !json_is_integer (value)) {
+            GST_MSG (LOG_LEVEL_DEBUG, priv->log_level,
+                "min-qp not found in %d dyn_params", k);
+          } else {
+            dyn_qp_present = TRUE;
+            priv->largs.outconf[j].dparams.dyn_min_max_qp_conf[dyn_min_max_qp_index].min_qp = json_integer_value (value);
+            priv->largs.outconf[j].dparams.dyn_min_max_qp_conf[dyn_min_max_qp_index].frame_num = frame_num;
+            priv->largs.outconf[j].dparams.dyn_min_max_qp_conf[dyn_min_max_qp_index].is_valid = TRUE;
+          }
+
+          value = json_object_get (dyn_params, "max-qp");
+          if (!value || !json_is_integer (value)) {
+            GST_MSG (LOG_LEVEL_DEBUG, priv->log_level,
+                "max-qp not found in %d dyn_params", k);
+          } else {
+            dyn_qp_present = TRUE;
+            priv->largs.outconf[j].dparams.dyn_min_max_qp_conf[dyn_min_max_qp_index].max_qp = json_integer_value (value);
+            priv->largs.outconf[j].dparams.dyn_min_max_qp_conf[dyn_min_max_qp_index].frame_num = frame_num;
+            priv->largs.outconf[j].dparams.dyn_min_max_qp_conf[dyn_min_max_qp_index].is_valid = TRUE;
+          }
+
+	  if (dyn_qp_present)
+            dyn_min_max_qp_index++;
+
         }
       }
     }
@@ -882,23 +922,6 @@ create_caps (CustomData * priv, int num)
 }
 
 GstElement *
-create_encparse (CustomData * priv, int num)
-{
-  gchar name[50];
-  GstElement *encparse;
-
-  if (priv->largs.codec_type == CODEC_H264) {
-    sprintf (name, "ench264parse%d", num);
-    encparse = gst_element_factory_make ("h264parse", name);
-  } else {
-    sprintf (name, "ench265parse%d", num);
-    encparse = gst_element_factory_make ("h265parse", name);
-  }
-
-  return encparse;
-}
-
-GstElement *
 create_enccaps (CustomData * priv, int num)
 {
   GstElement *capsfilter;
@@ -947,8 +970,6 @@ create_lookahead (CustomData * priv, int num)
 
   GST_MSG (LOG_LEVEL_DEBUG, priv->log_level, "dev-idx = %d",
       priv->largs.dev_idx);
-  GST_MSG (LOG_LEVEL_DEBUG, priv->log_level, "gop-length = %d",
-      priv->largs.outconf[num].gop_length);
   GST_MSG (LOG_LEVEL_DEBUG, priv->log_level, "b-frames = %d",
       priv->largs.outconf[num].b_frames);
   GST_MSG (LOG_LEVEL_DEBUG, priv->log_level, "codec-type = %d",
@@ -961,8 +982,6 @@ create_lookahead (CustomData * priv, int num)
 
   GST_MSG (LOG_LEVEL_DEBUG, priv->log_level, "temporal-aq = %d",
       priv->largs.outconf[num].temporal_aq);
-  GST_MSG (LOG_LEVEL_DEBUG, priv->log_level, "rc-mode = %d",
-      priv->largs.outconf[num].rc_mode);
 
   GST_MSG (LOG_LEVEL_DEBUG, priv->log_level, "lookahead-depth = %d",
       priv->largs.outconf[num].lookahead_depth);
@@ -970,13 +989,11 @@ create_lookahead (CustomData * priv, int num)
       priv->largs.lookahead_kernel);
   lookahead = gst_element_factory_make ("vvas_xlookahead", la_name);
   g_object_set (lookahead, "dev-idx", priv->largs.dev_idx,
-      "gop-length", priv->largs.outconf[num].gop_length,
       "b-frames", priv->largs.outconf[num].b_frames,
       "codec-type", priv->largs.codec_type,
       "spatial-aq", priv->largs.outconf[num].spatial_aq,
       "spatial-aq-gain", priv->largs.outconf[num].spatial_aq_gain,
       "temporal-aq", priv->largs.outconf[num].temporal_aq,
-      "rc-mode", priv->largs.outconf[num].rc_mode,
       "lookahead-depth", priv->largs.outconf[num].lookahead_depth,
       "kernel-name", priv->largs.lookahead_kernel, NULL);
   return lookahead;
@@ -1478,6 +1495,17 @@ probe_la_buffer (GstPad          *pad,
 
       pad_info->next_spatial_aq_gain_index ++;
     }
+
+    if ((pad_info->next_min_max_qp_index < pad_info->data_priv->largs.outconf[pad_info->index].dparams.num_dyn_params) &&
+        (pad_info->data_priv->largs.outconf[pad_info->index].dparams.dyn_min_max_qp_conf[pad_info->next_min_max_qp_index].is_valid) &&
+        (pad_info->frame_count == pad_info->data_priv->largs.outconf[pad_info->index].dparams.dyn_min_max_qp_conf[pad_info->next_min_max_qp_index].frame_num)) {
+      g_object_set(G_OBJECT(pad_info->data_priv->ltail[pad_info->index].lookahead), "min-qp",
+        (guint32)(pad_info->data_priv->largs.outconf[pad_info->index].dparams.dyn_min_max_qp_conf[pad_info->next_min_max_qp_index].min_qp), NULL);
+      g_object_set(G_OBJECT(pad_info->data_priv->ltail[pad_info->index].lookahead), "max-qp",
+        (guint32)(pad_info->data_priv->largs.outconf[pad_info->index].dparams.dyn_min_max_qp_conf[pad_info->next_min_max_qp_index].max_qp), NULL);
+
+      pad_info->next_min_max_qp_index ++;
+    }
   }
 
   /* If Lookahead is enabled, then insert the event at Lookahead sink pad instead of Encoder sink pad */ 
@@ -1517,6 +1545,17 @@ probe_enc_buffer (GstPad          *pad,
           (guint32)(pad_info->data_priv->largs.outconf[pad_info->index].dparams.dyn_bframe_conf[pad_info->next_bframe_index].b_frames), NULL);
 
         pad_info->next_bframe_index ++;
+      }
+
+      if ((pad_info->next_min_max_qp_index < pad_info->data_priv->largs.outconf[pad_info->index].dparams.num_dyn_params) &&
+          (pad_info->data_priv->largs.outconf[pad_info->index].dparams.dyn_min_max_qp_conf[pad_info->next_min_max_qp_index].is_valid) &&
+          (pad_info->frame_count == pad_info->data_priv->largs.outconf[pad_info->index].dparams.dyn_min_max_qp_conf[pad_info->next_min_max_qp_index].frame_num)) {
+        g_object_set(G_OBJECT(pad_info->data_priv->ltail[pad_info->index].encoder), "min-qp",
+          (guint32)(pad_info->data_priv->largs.outconf[pad_info->index].dparams.dyn_min_max_qp_conf[pad_info->next_min_max_qp_index].min_qp), NULL);
+        g_object_set(G_OBJECT(pad_info->data_priv->ltail[pad_info->index].encoder), "max-qp",
+          (guint32)(pad_info->data_priv->largs.outconf[pad_info->index].dparams.dyn_min_max_qp_conf[pad_info->next_min_max_qp_index].max_qp), NULL);
+
+        pad_info->next_min_max_qp_index ++;
       }
     }
 
@@ -1901,7 +1940,6 @@ testcase2:
       priv->ltail[i].videoratecaps = create_videoratecaps (priv, i);
       priv->ltail[i].lookahead = create_lookahead (priv, i);
       priv->ltail[i].encoder = create_encoder (priv, i);
-      priv->ltail[i].encparse = create_encparse (priv, i);
       priv->ltail[i].enccaps = create_enccaps (priv, i);
 
       priv->ltail[i].sink = create_sink (priv, i);
@@ -1911,7 +1949,6 @@ testcase2:
           !priv->ltail[i].videoratecaps ||
           !priv->ltail[i].lookahead ||
           !priv->ltail[i].encoder ||
-          !priv->ltail[i].encparse ||
           !priv->ltail[i].enc_queue ||
           !priv->ltail[i].enccaps || !priv->ltail[i].sink) {
         GST_MSG (LOG_LEVEL_ERROR, priv->log_level,
@@ -1939,7 +1976,6 @@ testcase2:
 
       priv->ltail[i].videoratecaps = create_videoratecaps (priv, i);
       priv->ltail[i].encoder = create_encoder (priv, i);
-      priv->ltail[i].encparse = create_encparse (priv, i);
       priv->ltail[i].enccaps = create_enccaps (priv, i);
 
       priv->ltail[i].sink = create_sink (priv, i);
@@ -1948,7 +1984,6 @@ testcase2:
           !priv->ltail[i].capsfilter ||
           !priv->ltail[i].videoratecaps ||
           !priv->ltail[i].encoder ||
-          !priv->ltail[i].encparse ||
           !priv->ltail[i].enc_queue ||
           !priv->ltail[i].enccaps || !priv->ltail[i].sink) {
         GST_MSG (LOG_LEVEL_ERROR, priv->log_level,
@@ -2012,7 +2047,6 @@ testcase2:
           priv->ltail[i].videoratecaps,
           priv->ltail[i].lookahead,
           priv->ltail[i].encoder,
-          priv->ltail[i].encparse,
           priv->ltail[i].enccaps, priv->ltail[i].sink, NULL);
     }
   } else {
@@ -2023,7 +2057,6 @@ testcase2:
           priv->ltail[i].videorate,
           priv->ltail[i].videoratecaps,
           priv->ltail[i].encoder,
-          priv->ltail[i].encparse,
           priv->ltail[i].enccaps, priv->ltail[i].sink, NULL);
     }
   }
@@ -2087,7 +2120,6 @@ testcase2:
               priv->ltail[i].videoratecaps,
               priv->ltail[i].lookahead,
               priv->ltail[i].encoder,
-              priv->ltail[i].encparse,
               priv->ltail[i].enccaps, priv->ltail[i].sink, NULL) != TRUE) {
         GST_MSG (LOG_LEVEL_ERROR, priv->log_level,
             "Tail %d elements could not be linked", i);
@@ -2102,7 +2134,6 @@ testcase2:
               priv->ltail[i].videorate,
               priv->ltail[i].videoratecaps,
               priv->ltail[i].encoder,
-              priv->ltail[i].encparse,
               priv->ltail[i].enccaps, priv->ltail[i].sink, NULL) != TRUE) {
         GST_MSG (LOG_LEVEL_ERROR, priv->log_level,
             "Tail %d elements could not be linked", i);
@@ -2384,6 +2415,7 @@ stop_pipeline:
       free(priv->largs.outconf[i].dparams.dyn_spatial_aq_conf);
       free(priv->largs.outconf[i].dparams.dyn_temporal_aq_conf);
       free(priv->largs.outconf[i].dparams.dyn_spatial_aq_gain_conf);
+      free(priv->largs.outconf[i].dparams.dyn_min_max_qp_conf);
     }
   }
   free (priv);
