@@ -41,6 +41,7 @@ fi
 
 cd /tmp/ && wget https://gstreamer.freedesktop.org/src/gst-plugins-base/gst-plugins-base-1.16.2.tar.xz && \
     tar -xvf gst-plugins-base-1.16.2.tar.xz && cd gst-plugins-base-1.16.2 && \
+    cd common && patch -p1 < /tmp/0001-build-Adapt-to-backwards-incompatible-change-in-GNU-.patch && cd .. && \
     patch -p1 < /tmp/0001-Add-Xilinx-s-format-support.patch
     patch -p1 < /tmp/0001-Videoaggregator-cleanup-functions.patch
     patch -p1 < /tmp/0001-gst-plugins-base-Add-HDR10-support.patch
@@ -65,7 +66,10 @@ rm -rf /tmp/gst-plugins-base-1.16.2*
 # GStreamer bad package installation
 cd /tmp/ && wget https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-1.16.2.tar.xz && \
     tar -xvf gst-plugins-bad-1.16.2.tar.xz && cd gst-plugins-bad-1.16.2 && \
+ cd common && patch -p1 < /tmp/0001-build-Adapt-to-backwards-incompatible-change-in-GNU-.patch && cd .. && \
  patch -p1 < /tmp/0001-VMAF-integration-in-gst-plugins-bad-1.16.2.patch && \
+ patch -p1 < /tmp/0001-Update-Colorimetry-and-SEI-parsing-for-HDR10.patch && \
+ patch -p1 < /tmp/0001-Derive-src-fps-from-vui_time_scale-vui_num_units_in_.patch && \
 mkdir subprojects && cd subprojects && git clone https://github.com/werti/vmaf.git -b v1.3.14-gstreamer && \
 cd vmaf &&  patch -p1 < /tmp/0001-Building-the-vmaf-as-dynamic-library.patch
 cd /tmp/gst-plugins-bad-1.16.2 && \

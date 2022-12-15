@@ -217,6 +217,8 @@ struct _GstVvas_XVCUDecPrivate
   gint cur_load;
   uint64_t reservation_id;
 #endif
+  GstClockTime last_pts;
+  gint genpts;
 };
 #define gstvvas_xvcudec_parent_class parent_class
 
@@ -250,7 +252,8 @@ enum
 #endif
   PROP_SPLITBUFF_MODE,
   PROP_AVOID_DYNAMIC_ALLOC,
-  PROP_DISABLE_HDR_SEI
+  PROP_DISABLE_HDR_SEI,
+  PROP_INTERPOLATE_TIMESTAMPS,
 };
 
 #define VVAS_VCUDEC_KERNEL_NAME_DEFAULT "decoder:decoder_1"
@@ -1015,6 +1018,8 @@ vvas_xvcudec_reset (GstVvas_XVCUDec * dec)
   priv->cu_res[0] = priv->cu_res[1] = NULL;
   priv->cur_load = 0;
 #endif
+  priv->last_pts = GST_CLOCK_TIME_NONE;
+  priv->genpts = 0;
 
 }
 
@@ -1113,6 +1118,45 @@ error:
   return FALSE;
 }
 
+static void
+vvas_xvcudec_set_pts (GstVvas_XVCUDec * dec, GstVideoCodecFrame * frame,
+    GstClockTime out_ts)
+{
+  GstVideoDecoder *decoder = GST_VIDEO_DECODER (dec);
+  GstVvas_XVCUDecPrivate *priv = dec->priv;
+  GstVideoCodecState *state = gst_video_decoder_get_output_state (decoder);
+
+  if (state == NULL) {
+    frame->pts = GST_CLOCK_TIME_NONE;
+    return;
+  }
+
+  if (state->info.fps_d == 0 || state->info.fps_n == 0) {
+    frame->pts = GST_CLOCK_TIME_NONE;
+    return;
+  }
+
+  if (priv->last_pts == GST_CLOCK_TIME_NONE) {
+    if (out_ts == GST_CLOCK_TIME_NONE) {
+      frame->pts = 0;
+      priv->genpts = 0;
+    } else {
+      frame->pts = out_ts;
+      priv->genpts =
+          frame->pts / gst_util_uint64_scale (GST_SECOND, state->info.fps_d,
+          state->info.fps_n);
+    }
+  } else {
+    frame->pts =
+        gst_util_uint64_scale (priv->genpts * GST_SECOND, state->info.fps_d,
+        state->info.fps_n);
+  }
+
+  priv->last_pts = frame->pts;
+  priv->genpts++;
+  return;
+}
+
 static GstFlowReturn
 vvas_xvcudec_read_out_buffer (GstVvas_XVCUDec * dec, guint idx,
     GstVideoCodecState * out_state, GstClockTime out_ts)
@@ -1135,7 +1179,11 @@ vvas_xvcudec_read_out_buffer (GstVvas_XVCUDec * dec, guint idx,
     return GST_FLOW_EOS;
   }
 
-  frame->pts = out_ts;
+  if (dec->interpolate_timestamps) {
+    vvas_xvcudec_set_pts (dec, frame, out_ts);
+  } else {
+    frame->pts = out_ts;
+  }
 
   if (dec->priv->need_copy) {
     GstBuffer *new_outbuf, *outbuf;
@@ -2216,6 +2264,9 @@ gstvvas_xvcudec_set_property (GObject * object, guint prop_id,
     case PROP_DISABLE_HDR_SEI:
       dec->disable_hdr10_sei = g_value_get_boolean (value);
       break;
+    case PROP_INTERPOLATE_TIMESTAMPS:
+      dec->interpolate_timestamps = g_value_get_boolean (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -2259,6 +2310,9 @@ gstvvas_xvcudec_get_property (GObject * object, guint prop_id,
       break;
     case PROP_DISABLE_HDR_SEI:
       g_value_set_boolean (value, dec->disable_hdr10_sei);
+      break;
+    case PROP_INTERPOLATE_TIMESTAMPS:
+      g_value_set_boolean (value, dec->interpolate_timestamps);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -3136,6 +3190,11 @@ gstvvas_xvcudec_class_init (GstVvas_XVCUDecClass * klass)
           "Whether to passthrough HDR10/10+ SEI messages or not",
           FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_INTERPOLATE_TIMESTAMPS,
+      g_param_spec_boolean ("interpolate-timestamps", "Interpolate timestamps",
+          "Interpolate PTS of output buffers",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   GST_DEBUG_CATEGORY_INIT (gstvvas_xvcudec_debug_category, "vvas_xvcudec", 0,
       "debug category for vcu h264/h265 decoder element");
   GST_DEBUG_CATEGORY_GET (GST_CAT_PERFORMANCE, "GST_PERFORMANCE");
@@ -3157,6 +3216,7 @@ gstvvas_xvcudec_init (GstVvas_XVCUDec * dec)
   dec->splitbuff_mode = FALSE;
   dec->avoid_dynamic_alloc = TRUE;
   dec->disable_hdr10_sei = FALSE;
+  dec->interpolate_timestamps = FALSE;
   priv->cu_idx = -1;
   priv->mem_released_handler = 0;
   priv->allocator = NULL;

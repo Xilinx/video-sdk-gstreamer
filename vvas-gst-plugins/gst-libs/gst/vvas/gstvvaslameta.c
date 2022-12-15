@@ -45,6 +45,8 @@ gst_vvas_la_meta_init (GstMeta * meta, gpointer params, GstBuffer * buffer)
   vvasmeta->spatial_aq = FALSE;
   vvasmeta->temporal_aq = FALSE;
   vvasmeta->spatial_aq_gain = 0;
+  vvasmeta->min_qp = 0;
+  vvasmeta->max_qp = 0;
   vvasmeta->qpmap = NULL;
   vvasmeta->rc_fsfa = NULL;
   return TRUE;
@@ -101,6 +103,8 @@ gst_vvas_la_meta_transform (GstBuffer * dest, GstMeta * meta,
     dmeta->spatial_aq = smeta->spatial_aq;
     dmeta->temporal_aq = smeta->temporal_aq;
     dmeta->spatial_aq_gain = smeta->spatial_aq_gain;
+    dmeta->min_qp = smeta->min_qp;
+    dmeta->max_qp = smeta->max_qp;
 
   } else {
     GST_ERROR ("unsupported transform type : %s", g_quark_to_string (type));

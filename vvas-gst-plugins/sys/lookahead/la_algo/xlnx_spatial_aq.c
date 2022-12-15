@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2019, Xilinx Inc - All rights reserved
- * Xilinx Lookahead XMA Plugin
+ * Xilinx Lookahead Plugin
  *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
  * not use this file except in compliance with the License. A copy of the
@@ -20,12 +20,10 @@
 #include <assert.h>
 #include <math.h>
 #include <string.h>
-#include <xma.h>
 #include "xlnx_queue.h"
 #include "xlnx_spatial_aq.h"
 #include "xlnx_la_defines.h"
 
-#define XMA_XLNX_ALGOS "xlnx_spatial_aq"
 /*#define XLNX_MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 static const uint32_t XLNX_MIN_QP = 9;
 static const uint32_t XLNX_MAX_QP = 0;
@@ -106,8 +104,9 @@ typedef struct spatial_cfg
     uint32_t blockWidth;
     uint32_t blockHeight;
     uint32_t la_depth;
-    uint32_t spatial_aq_mode;
-    float spatial_aq_gain;
+    uint32_t dyn_frame_num;
+    uint32_t spatial_aq_mode[XLNX_DEFAULT_LA_DEPTH + 1];
+    float spatial_aq_gain[XLNX_DEFAULT_LA_DEPTH + 1];
     uint32_t num_mb;
     uint32_t qpmap_size;
 } spatial_cfg_t;
@@ -123,17 +122,22 @@ void update_aq_gain(xlnx_spatial_aq_t sp, aq_config_t *cfg)
 {
     xlnx_spatial_ctx_t *ctx = (xlnx_spatial_ctx_t *)sp;
     spatial_cfg_t *mycfg = &ctx->cfg;
-    mycfg->spatial_aq_mode = cfg->spatial_aq_mode;
+    mycfg->spatial_aq_mode[mycfg->dyn_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] =
+                                                          cfg->spatial_aq_mode;
+
     if (mycfg->height < 720) {
-        mycfg->spatial_aq_gain = 1;
+        mycfg->spatial_aq_gain[mycfg->dyn_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = 1;
     } else {
-        mycfg->spatial_aq_gain = (float)(3.0 * cfg->spatial_aq_gain)/100;
+        mycfg->spatial_aq_gain[mycfg->dyn_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] =
+                                          (float)(3.0 * cfg->spatial_aq_gain)/100;
     }
+    mycfg->dyn_frame_num++;
     return;
 }
 
 static void copy_config(xlnx_spatial_ctx_t *ctx, aq_config_t *cfg)
 {
+    int32_t i;
     spatial_cfg_t *mycfg = &ctx->cfg;
     mycfg->width = cfg->width;
     mycfg->height = cfg->height;
@@ -146,12 +150,16 @@ static void copy_config(xlnx_spatial_ctx_t *ctx, aq_config_t *cfg)
     mycfg->blockWidth = cfg->blockWidth;
     mycfg->blockHeight = cfg->blockHeight;
     mycfg->la_depth = cfg->la_depth;
-    mycfg->spatial_aq_mode = cfg->spatial_aq_mode;
-    if (mycfg->height < 720) {
-        mycfg->spatial_aq_gain = 1;
-    } else {
-        mycfg->spatial_aq_gain = (float)(3.0 * cfg->spatial_aq_gain)/100;
+
+    for(i = 0; i < (XLNX_DEFAULT_LA_DEPTH + 1); i++) {
+        mycfg->spatial_aq_mode[i] = cfg->spatial_aq_mode;
+        if (mycfg->height < 720) {
+            mycfg->spatial_aq_gain[i] = 1;
+        } else {
+            mycfg->spatial_aq_gain[i] = (float)(3.0 * cfg->spatial_aq_gain)/100;
+        }
     }
+    mycfg->dyn_frame_num = 0;
     mycfg->num_mb = cfg->num_mb;
     mycfg->qpmap_size = cfg->qpmap_size;
 }
@@ -238,7 +246,7 @@ xlnx_status xlnx_spatial_gen_qpmap(xlnx_spatial_aq_t sp,
     uint32_t frameActivity = 0;
     int block_width = cfg->blockWidth;
     int div_factor = (block_width*block_width)/4;
-    uint32_t aq_mode = cfg->spatial_aq_mode;
+    uint32_t aq_mode = cfg->spatial_aq_mode[frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)];
     int i_decimate_factor = 2;
     int i_actual_mb_width = cfg->actual_mb_w;
     int i_actual_mb_height = cfg->actual_mb_h;
@@ -246,7 +254,7 @@ xlnx_status xlnx_spatial_gen_qpmap(xlnx_spatial_aq_t sp,
 
     int i_mb_stride = i_padded_mb_width;
     int actual_mb_count =  i_actual_mb_width * i_actual_mb_height;
-    float f_aq_strength = cfg->spatial_aq_gain;
+    float f_aq_strength = cfg->spatial_aq_gain[frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)];
     int i_aq_prev_frame_enable = 0;
     float *spatial_aq_map;
     spatial_qpmap_t smap;

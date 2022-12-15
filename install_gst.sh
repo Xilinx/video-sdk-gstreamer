@@ -44,6 +44,8 @@ if [[ $os_distr == *Ubuntu* ]]; then
 		OS_VERSION="18_04"
         elif [[ $os_version =~ .*20.04.* ]]; then
 		OS_VERSION="20_04"
+        elif [[ $os_version =~ .*22.04.* ]]; then
+		OS_VERSION="22_04"
         else
                 echo "Unsupported OS version"
                 return 1
@@ -91,6 +93,9 @@ if [[ $OS_TYPE == "UBUNTU" ]]; then
         elif [[ $os_version =~ .*20.04.* ]]; then
                 OS_VERSION="20_04"
                 sudo apt-get install -y libpangocairo-1.0-0 librust-pangocairo-dev
+        elif [[ $os_version =~ .*22.04.* ]]; then
+                OS_VERSION="22_04"
+                sudo apt-get install -y libpangocairo-1.0-0 librust-pangocairo-dev gtk-doc-tools
         else
                 echo "Unsupported OS version"
                 return 1
@@ -147,8 +152,11 @@ if [ $retval -ne 0 ]; then
 fi
 
 # GStreamer core package installation
+cp ./patches/0001-build-Adapt-to-backwards-incompatible-change-in-GNU-.patch /tmp
+
 cd /tmp/ && wget https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.16.2.tar.xz --no-check-certificate && \
     tar -xvf gstreamer-1.16.2.tar.xz && cd gstreamer-1.16.2 && \
+    cd common && patch -p1 < /tmp/0001-build-Adapt-to-backwards-incompatible-change-in-GNU-.patch && cd .. && \
     ./autogen.sh --prefix=/opt/xilinx/vvas --disable-gtk-doc
     make -j$cpu_count && sudo make install
 retval=$?
@@ -167,6 +175,7 @@ cp ./patches/0001-gst-plugins-base-Add-HDR10-support.patch /tmp
 
 cd /tmp/ && wget https://gstreamer.freedesktop.org/src/gst-plugins-base/gst-plugins-base-1.16.2.tar.xz --no-check-certificate && \
     tar -xvf gst-plugins-base-1.16.2.tar.xz && cd gst-plugins-base-1.16.2 && \
+    cd common && patch -p1 < /tmp/0001-build-Adapt-to-backwards-incompatible-change-in-GNU-.patch && cd .. && \
     patch -p1 < /tmp/0001-Add-Xilinx-s-format-support.patch && \
     patch -p1 < /tmp/0001-gst-plugins-base-Add-HDR10-support.patch
 retval=$?
@@ -191,6 +200,7 @@ cp ./patches/0001-Use-helper-function-to-map-colorimetry-parameters.patch /tmp
 
 cd /tmp/ && wget https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-1.16.2.tar.xz --no-check-certificate && \
     tar -xvf gst-plugins-good-1.16.2.tar.xz && cd gst-plugins-good-1.16.2 && \
+    cd common && patch -p1 < /tmp/0001-build-Adapt-to-backwards-incompatible-change-in-GNU-.patch && cd .. && \
     patch -p1 < /tmp/0001-Use-helper-function-to-map-colorimetry-parameters.patch && \
     ./autogen.sh --prefix=/opt/xilinx/vvas --disable-gtk-doc && \
     make -j$cpu_count && sudo make install
@@ -205,9 +215,12 @@ rm -rf /tmp/gst-plugins-good-1.16.2*
 
 # GStreamer bad package installation
 cp ./patches/0001-Update-Colorimetry-and-SEI-parsing-for-HDR10.patch /tmp
+cp ./patches/0001-Derive-src-fps-from-vui_time_scale-vui_num_units_in_.patch /tmp
 cd /tmp/ && wget https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-1.16.2.tar.xz --no-check-certificate && \
     tar -xvf gst-plugins-bad-1.16.2.tar.xz && cd gst-plugins-bad-1.16.2 && \
+    cd common && patch -p1 < /tmp/0001-build-Adapt-to-backwards-incompatible-change-in-GNU-.patch && cd .. && \
     patch -p1 < /tmp/0001-Update-Colorimetry-and-SEI-parsing-for-HDR10.patch && \
+    patch -p1 < /tmp/0001-Derive-src-fps-from-vui_time_scale-vui_num_units_in_.patch && \
     ./autogen.sh --prefix=/opt/xilinx/vvas --disable-gtk-doc --disable-openexr --disable-yadif --disable-mpegpsmux && make -j$cpu_count && sudo make install
 retval=$?
 if [ $retval -ne 0 ]; then

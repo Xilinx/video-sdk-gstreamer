@@ -48,6 +48,7 @@ GST_DEBUG_CATEGORY_STATIC (gst_vvas_xvcuenc_debug_category);
 GST_DEBUG_CATEGORY_STATIC (GST_CAT_PERFORMANCE);
 
 #define VVAS_LOOKAHEAD_QUERY_NAME "VVASLookaheadQuery"
+#define VVAS_ENCODER_QUERY_NAME "VVASEncoderQuery"
 
 #define GST_CAPS_FEATURE_MEMORY_XLNX "memory:XRT"
 static const int ERT_CMD_SIZE = 4096;
@@ -144,6 +145,9 @@ typedef struct enc_dyn_params
   uint32_t bit_rate;
   bool is_bframes_changed;
   uint8_t num_b_frames;
+  bool is_min_max_qp_changed;
+  uint32_t min_qp;
+  uint32_t max_qp;
 }enc_dyn_params_t;
 
 typedef struct host_dev_data
@@ -503,7 +507,10 @@ gst_vvas_enc_loop_filter_mode_get_type (void)
 #define GST_VVAS_VIDEO_ENC_LOW_BANDWIDTH_DEFAULT                          FALSE
 #define GST_VVAS_VCU_ENC_SK_DEFAULT_NAME                   "kernel_vcu_encoder"
 #define GST_VVAS_VIDEO_ENC_RC_MODE_DEFAULT                                 TRUE
+#define GST_VVAS_VIDEO_ENC_TUNE_METRICS_DEFAULT                           FALSE
 #define GST_VVAS_VIDEO_ENC_DEPENDENT_SLICE_DEFAULT                        FALSE
+#define GST_VVAS_VIDEO_ENC_ULTRA_LOW_LATENCY_DEFAULT                      FALSE
+#define GST_VVAS_VIDEO_ENC_AVC_LOWLAT_DEFAULT                             FALSE
 #define GST_VVAS_VIDEO_ENC_IP_DELTA_DEFAULT                                  -1
 #define GST_VVAS_VIDEO_ENC_PB_DELTA_DEFAULT                                  -1
 #define GST_VVAS_VIDEO_ENC_LOOP_FILTER_BETA_DEFAULT                          -1
@@ -511,6 +518,7 @@ gst_vvas_enc_loop_filter_mode_get_type (void)
 #define VVAS_VCUENC_KERNEL_NAME_DEFAULT                     "encoder:encoder_1"
 #define DEFAULT_DEVICE_INDEX                                                 -1
 #define DEFAULT_SK_CURRENT_INDEX                                             -1
+#define UNSET_NUM_B_FRAMES                                                   -1
 
 /* Properties */
 enum
@@ -522,6 +530,7 @@ enum
   PROP_SK_START_INDEX,
   PROP_SK_CURRENT_INDEX,
   PROP_DEVICE_INDEX,
+  PROP_TUNE_METRICS,
 #ifdef ENABLE_XRM_SUPPORT
   PROP_RESERVATION_ID,
 #endif
@@ -558,7 +567,9 @@ enum
   PROP_PB_DELTA,
   PROP_LOOP_FILTER_BETA_OFFSET,
   PROP_LOOK_FILTER_TC_OFFSET,
-  PROP_ENABLE_PIPELINE
+  PROP_ENABLE_PIPELINE,
+  PROP_ULTRA_LOW_LATENCY,
+  PROP_AVC_LOWLAT,
 };
 
 typedef struct _enc_obuf_info
@@ -614,6 +625,11 @@ struct _GstVvasXVCUEncPrivate
   gboolean is_dyn_params_valid;
   gboolean is_bitrate_changed;
   gboolean is_bframes_changed;
+  gboolean is_min_max_qp_changed;
+  gboolean dynamic_gop;
+  gint64 retry_timeout;
+  GCond timeout_cond;
+  GMutex timeout_lock;
 };
 #define gst_vvas_xvcuenc_parent_class parent_class
 
@@ -747,6 +763,7 @@ gst_vvas_xvcuenc_map_params (GstVvasXVCUEnc * enc)
   const gchar *EnableFillerData = "ENABLE";
   const gchar *GDRMode = "DISABLE";
   const gchar *ConstIntraPred = "DISABLE";
+  const gchar *AvcLowLat = "DISABLE";
   const gchar *Profile = "AVC_HIGH";
   const gchar *Level = "1";
   const gchar *DependentSlice = "FALSE";
@@ -882,6 +899,14 @@ gst_vvas_xvcuenc_map_params (GstVvasXVCUEnc * enc)
       ConstIntraPred = "ENABLE";
       break;
   }
+  switch (enc->avc_lowlat) {
+    case FALSE:
+      AvcLowLat = "DISABLE";
+      break;
+    case TRUE:
+      AvcLowLat = "ENABLE";
+      break;
+  }
 
   if (enc->slice_qp == -1)
     strcpy (SliceQP, "AUTO");
@@ -916,6 +941,13 @@ gst_vvas_xvcuenc_map_params (GstVvasXVCUEnc * enc)
           enc->profile, Profile);
     }
     GST_LOG_OBJECT (enc, "profile = %s and level = %s", Profile, enc->level);
+
+    if (priv->dynamic_gop && (!g_strcmp0 (Profile, "AVC_BASELINE")
+            || !g_strcmp0 (Profile, "AVC_HIGH10_INTRA"))) {
+      GST_ELEMENT_ERROR (enc, LIBRARY, SETTINGS, NULL,
+          ("Encoder profile is I and/or P only, enabling dynamic GOP results in incorrect delta QPs"));
+      return FALSE;
+    }
 
     sprintf (params, "[INPUT]\n"
         "Width = %d\n"
@@ -960,7 +992,8 @@ gst_vvas_xvcuenc_map_params (GstVvasXVCUEnc * enc)
         "ConstrainedIntraPred = %s\n"
         "LambdaCtrlMode = DEFAULT_LDA\n"
         "CacheLevel2 = %s\n"
-        "NumCore = %d\n",
+        "NumCore = %d\n"
+	"AvcLowLat = %s\n",
         width, height, format, RateCtrlMode,
         GST_VIDEO_INFO_FPS_N (&in_vinfo), GST_VIDEO_INFO_FPS_D (&in_vinfo),
         enc->target_bitrate, enc->max_bitrate, SliceQP,
@@ -973,7 +1006,7 @@ gst_vvas_xvcuenc_map_params (GstVvasXVCUEnc * enc)
         enc->color_description, enc->transfer_characteristics, 
         enc->color_matrix, ScalingList, EntropyMode, LoopFilter, 
         enc->loop_filter_beta_offset, enc->loop_filter_tc_offset,
-        ConstIntraPred, PrefetchBuffer, enc->num_cores);
+        ConstIntraPred, PrefetchBuffer, enc->num_cores, AvcLowLat);
   } else if (enc->codec_type == VVAS_CODEC_H265) {
     Profile = vvas_get_vcu_h265_profile_string (enc->profile);
     if (!Profile) {
@@ -982,6 +1015,13 @@ gst_vvas_xvcuenc_map_params (GstVvasXVCUEnc * enc)
       Profile = "HEVC_MAIN";
       GST_WARNING_OBJECT (enc, "wrong profile %s received using default %s",
           enc->profile, Profile);
+    }
+
+    if (priv->dynamic_gop && (!g_strcmp0 (Profile, "HEVC_MAIN_INTRA")
+            || !g_strcmp0 (Profile, "HEVC_MAIN10_INTRA"))) {
+      GST_ELEMENT_ERROR (enc, LIBRARY, SETTINGS, NULL,
+          ("Encoder profile is I and/or P only, enabling dynamic GOP results in incorrect delta QPs"));
+      return FALSE;
     }
 
     switch (enc->dependent_slice) {
@@ -2066,6 +2106,9 @@ vvas_xvcuenc_reset (GstVvasXVCUEnc * enc)
   priv->allocated_intr_bufs = FALSE;
   priv->is_bframes_changed = FALSE;
   priv->is_bitrate_changed = FALSE;
+  priv->is_min_max_qp_changed = FALSE;
+  priv->retry_timeout = 0.1 * G_TIME_SPAN_MILLISECOND;
+  priv->dynamic_gop = 0;
 
 #ifdef ENABLE_XRM_SUPPORT
   priv->xrm_ctx = NULL;
@@ -2599,9 +2642,14 @@ vvas_xvcuenc_send_frame (GstVvasXVCUEnc * enc, GstBuffer *inbuf,
   payload_buf->dyn_params.is_bframes_changed = priv->is_bframes_changed;
   payload_buf->dyn_params.num_b_frames = enc->b_frames;
 
+  payload_buf->dyn_params.is_min_max_qp_changed = priv->is_min_max_qp_changed;
+  payload_buf->dyn_params.min_qp = enc->min_qp;
+  payload_buf->dyn_params.max_qp = enc->max_qp;
+
   priv->is_dyn_params_valid = FALSE;
   priv->is_bframes_changed = FALSE;
   priv->is_bitrate_changed = FALSE;
+  priv->is_min_max_qp_changed = FALSE;
 
   lameta = gst_buffer_get_vvas_la_meta (inbuf);
   if (lameta) {
@@ -2615,7 +2663,7 @@ vvas_xvcuenc_send_frame (GstVvasXVCUEnc * enc, GstBuffer *inbuf,
       invalid_param = TRUE;
     }
 
-    if (lameta->num_bframes != enc->b_frames) {
+    if ((lameta->num_bframes != enc->b_frames) && (!enc->ultra_low_latency)) {
       if (enc->gop_mode == DEFAULT_GOP) {
         payload_buf->dyn_params.is_bframes_changed = TRUE;
         payload_buf->dyn_params.num_b_frames = lameta->num_bframes;
@@ -2627,6 +2675,18 @@ vvas_xvcuenc_send_frame (GstVvasXVCUEnc * enc, GstBuffer *inbuf,
             enc->gop_mode);
         invalid_param = TRUE;
       }
+    } else if ((lameta->num_bframes != enc->b_frames) && (enc->ultra_low_latency)) {
+      GST_ERROR_OBJECT (enc, "b-frames in LAMeta (%u) cannot be changed as "
+          "encoder ultra-low-latency mode is enabled", lameta->num_bframes);
+      invalid_param = TRUE;
+    }
+
+    if ((lameta->min_qp != enc->min_qp) || (lameta->max_qp != enc->max_qp)) {
+      payload_buf->dyn_params.is_min_max_qp_changed = TRUE;
+      payload_buf->dyn_params.min_qp = lameta->min_qp;
+      payload_buf->dyn_params.max_qp = lameta->max_qp;
+      enc->min_qp = lameta->min_qp;
+      enc->max_qp = lameta->max_qp;
     }
 
     if (lameta->codec_type != enc->codec_type) {
@@ -3034,6 +3094,8 @@ vvas_xvcuenc_receive_out_frame (GstVvasXVCUEnc * enc)
       ((uint64_t) (priv->sk_payload_buf->phy_addr) >> 32) & 0xFFFFFFFF;
   payload_data[num_idx++] = sizeof (sk_payload_data);
 
+try_again:
+
   GST_LOG_OBJECT (enc, "sending VCU_RECEIVE command to softkernel");
 
   /* send command to softkernel */
@@ -3062,14 +3124,29 @@ vvas_xvcuenc_receive_out_frame (GstVvasXVCUEnc * enc)
 
   GST_LOG_OBJECT (enc, "freed index count received from softkernel = %d",
       payload_buf->freed_index_cnt);
+
+  g_mutex_lock (&priv->timeout_lock);
   if (payload_buf->freed_index_cnt == 0) {
     if (payload_buf->end_encoding) {
       GST_INFO_OBJECT (enc, "received EOS from softkernel");
+      g_mutex_unlock (&priv->timeout_lock);
       return GST_FLOW_EOS;
     }
     GST_DEBUG_OBJECT (enc, "no encoded buffers to consume");
-    return GST_FLOW_OK;
+    if (enc->ultra_low_latency) {
+      gint64 end_time = g_get_monotonic_time () + priv->retry_timeout;
+      if (!g_cond_wait_until (&priv->timeout_cond, &priv->timeout_lock,
+              end_time)) {
+        GST_LOG_OBJECT (enc, "timeout occured, try receive command again");
+      }
+      g_mutex_unlock (&priv->timeout_lock);
+      goto try_again;
+    } else {
+      g_mutex_unlock (&priv->timeout_lock);
+      return GST_FLOW_OK;
+    }
   }
+  g_mutex_unlock (&priv->timeout_lock);
 
   memcpy (&priv->last_rcvd_payload, payload_buf, sizeof (sk_payload_data));
 
@@ -3702,6 +3779,21 @@ gst_vvas_xvcuenc_set_format (GstVideoEncoder * encoder,
     return FALSE;
   }
 
+  if (enc->ultra_low_latency) {
+    if (enc->b_frames == UNSET_NUM_B_FRAMES) {
+      enc->b_frames = 0;
+      GST_DEBUG_OBJECT (enc,
+          "ultra-low-latency mode enabled, seting b-frames to 0");
+    } else if (enc->b_frames != 0) {
+      GST_ELEMENT_ERROR (enc, LIBRARY, SETTINGS, NULL,
+          ("Cannot encode b-frames in ultra-low-latency mode"));
+      return FALSE;
+    }
+  }
+  enc->b_frames =
+      enc->b_frames ==
+      UNSET_NUM_B_FRAMES ? GST_VVAS_VIDEO_ENC_B_FRAMES_DEFAULT : enc->b_frames;
+
   switch (enc->gop_mode) {
     case DEFAULT_GOP:
       if (enc->b_frames < 0 || enc->b_frames > 4) {
@@ -3730,6 +3822,26 @@ gst_vvas_xvcuenc_set_format (GstVideoEncoder * encoder,
     GST_ELEMENT_ERROR (enc, LIBRARY, SETTINGS, NULL,
         ("b-frames should zero when control-rate is set to low-latency"));
     return FALSE;
+  }
+
+  if (enc->codec_type == VVAS_CODEC_H264) {
+    if (!enc->ultra_low_latency && enc->avc_lowlat) {
+      GST_ELEMENT_ERROR (enc, LIBRARY, SETTINGS, NULL,
+          ("avc-lowlat flag is not needed when ulta-low-latency mode is disabled"));
+      return FALSE;
+    } else if (enc->ultra_low_latency && !enc->avc_lowlat) {
+      if (enc->num_cores > 1) {
+        GST_ELEMENT_ERROR (enc, LIBRARY, SETTINGS, NULL,
+            ("Set avc-lowlat to allow for multiple cores with ultra-low-latency"));
+        return FALSE;
+      }
+      if ((GST_VIDEO_INFO_WIDTH (&in_vinfo) > 1920)
+          || (GST_VIDEO_INFO_HEIGHT (&in_vinfo) > 1920)) {
+        GST_ELEMENT_ERROR (enc, LIBRARY, SETTINGS, NULL,
+            ("Set avc-lowlat to disable pipelining for higher resolutions"));
+        return FALSE;
+      }
+    }
   }
 
   if (do_reconfigure) {
@@ -3802,13 +3914,15 @@ gst_vvas_xvcuenc_set_format (GstVideoEncoder * encoder,
 
   /* query lookahead parameters */
   qstruct = gst_structure_new (VVAS_LOOKAHEAD_QUERY_NAME,
+      "b-frames", G_TYPE_INT, 0,
+      "dynamic-gop", G_TYPE_BOOLEAN, FALSE,
       "la-depth", G_TYPE_UINT, 0, NULL);
   la_query = gst_query_new_custom (GST_QUERY_CUSTOM, qstruct);
   bret = gst_pad_query (encoder->srcpad, la_query);
   if (bret) {
     const GstStructure *mod_qstruct = gst_query_get_structure (la_query);
     guint la_depth = 0;
-    gboolean la_rc_mode = FALSE;
+    gint b_frames = 0;
 
     bret = gst_structure_get_uint (mod_qstruct, "la-depth", &la_depth);
     if (!bret) {
@@ -3817,17 +3931,10 @@ gst_vvas_xvcuenc_set_format (GstVideoEncoder * encoder,
       return FALSE;
     }
 
-    bret = gst_structure_get_boolean (mod_qstruct, "rc-mode", &la_rc_mode);
-    if (!bret) {
-      GST_ERROR_OBJECT (enc, "failed to get rc-mode from query");
-      gst_query_unref (la_query);
-      return FALSE;
-    }
+    GST_INFO_OBJECT (enc, "received lookahead-depth %u"
+        " from upstream", la_depth);
 
-    GST_INFO_OBJECT (enc, "received lookahead-depth %u & rc-mode %u"
-        " from upstream", la_depth, la_rc_mode);
-
-    if (!la_rc_mode || !la_depth || enc->control_rate != RC_CBR) {
+    if (!la_depth || enc->control_rate != RC_CBR) {
       GST_INFO_OBJECT (enc, "disabling custom rate control");
       enc->rc_mode = FALSE;
     }
@@ -3845,9 +3952,38 @@ gst_vvas_xvcuenc_set_format (GstVideoEncoder * encoder,
       enc->min_qp = 20;
     }
 
-    if (la_depth > 0) {
-      GST_INFO_OBJECT (enc, "setting qp_mode to RELATIVE_LOAD as lookahead > 0");
+    if (la_depth > 0 && enc->tune_metrics == FALSE) {
+      GST_INFO_OBJECT (enc,
+          "setting qp_mode to RELATIVE_LOAD as lookahead > 0 and tune-metrics not enabled");
       enc->qp_mode = RELATIVE_LOAD;
+    }
+
+    bret = gst_structure_get_boolean (mod_qstruct, "dynamic-gop", &priv->dynamic_gop);
+    if (!bret) {
+      GST_ERROR_OBJECT (enc, "failed to get dynamic-gop from query");
+      gst_query_unref (la_query);
+      return FALSE;
+    }
+
+    GST_INFO_OBJECT (enc, "received dynamic-gop %u"
+        " from upstream", priv->dynamic_gop);
+
+    bret = gst_structure_get_int (mod_qstruct, "b-frames", &b_frames);
+    if (!bret) {
+      GST_ERROR_OBJECT (enc, "failed to get b-frames from query");
+      gst_query_unref (la_query);
+      return FALSE;
+    }
+
+    GST_INFO_OBJECT (enc, "received b-frames %d"
+        " from upstream", b_frames);
+
+    if (enc->b_frames != b_frames) {
+      GST_ELEMENT_ERROR (enc, LIBRARY, SETTINGS, NULL,
+          ("lookahead (%d) and encoder (%d) are configured with "
+              "different b-frames", b_frames, enc->b_frames));
+      gst_query_unref (la_query);
+      return FALSE;
     }
   } else {
     GST_INFO_OBJECT (enc, "failed to query lookahead depth, "
@@ -3856,6 +3992,19 @@ gst_vvas_xvcuenc_set_format (GstVideoEncoder * encoder,
   }
   gst_query_unref (la_query);
 
+  if (enc->rc_mode && enc->filler_data) {
+    GST_ELEMENT_ERROR (enc, LIBRARY, SETTINGS, NULL,
+        ("Encoder does not support filler-data, when Lookahead rate control is enabled "
+	     "rc-mode (%d), filler-data (%d)", enc->rc_mode, enc->filler_data));
+    return FALSE;
+  }
+
+  if (enc->tune_metrics == TRUE) {
+    GST_INFO_OBJECT (enc,
+        "setting qp_mode to UNIFORM_QP and scaling_list to FLAT as tune-metrics enabled");
+    enc->qp_mode = UNIFORM_QP;
+    enc->scaling_list = SCALING_LIST_FLAT;
+  }
   if (!priv->init_done) {
     bret = vvas_xvcuenc_preinit (enc);
     if (!bret)
@@ -3984,6 +4133,40 @@ error:
   return FALSE;
 }
 
+static gboolean
+gst_vvas_xvcuenc_sink_query (GstVideoEncoder * encoder, GstQuery * query)
+{
+  GstVvasXVCUEnc *enc = GST_VVAS_XVCUENC (encoder);
+  switch (GST_QUERY_TYPE (query)) {
+    case GST_QUERY_CUSTOM:{
+      GstStructure *qstruct = NULL;
+
+      GST_DEBUG_OBJECT (enc, "received CUSTOM query");
+      if (enc->control_rate != RC_CBR) {
+        GST_INFO_OBJECT (enc, "disabling custom rate control");
+        enc->rc_mode = FALSE;
+      }
+
+      qstruct = gst_query_writable_structure (query);
+      if (qstruct && !g_strcmp0 (gst_structure_get_name (qstruct),
+              VVAS_ENCODER_QUERY_NAME)) {
+        gst_structure_set (qstruct,
+            "gop-length", G_TYPE_UINT, enc->gop_length,
+            "ultra-low-latency", G_TYPE_BOOLEAN, enc->ultra_low_latency,
+            "rc-mode", G_TYPE_BOOLEAN, enc->rc_mode, NULL);
+        GST_INFO_OBJECT (enc,
+            "updating gop-length %u rc-mode %u in query",
+            enc->gop_length, enc->rc_mode);
+        return TRUE;
+      }
+    }
+    default:
+      break;
+  }
+
+  return GST_VIDEO_ENCODER_CLASS (parent_class)->sink_query (encoder, query);
+}
+
 static void
 gst_vvas_xvcuenc_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec)
@@ -4016,11 +4199,16 @@ gst_vvas_xvcuenc_set_property (GObject * object, guint prop_id,
     case PROP_B_FRAMES:
       GST_OBJECT_LOCK (enc);
       if (GST_STATE(enc) == GST_STATE_NULL || GST_STATE(enc) == GST_STATE_READY) {
-        enc->b_frames = g_value_get_uint (value);
+        enc->b_frames = g_value_get_int (value);
       } else if (GST_STATE(enc) > GST_STATE_READY && enc->gop_mode == DEFAULT_GOP) {
-        priv->is_bframes_changed = TRUE;
-        priv->is_dyn_params_valid = TRUE;
-        enc->b_frames = g_value_get_uint (value);
+        if (enc->ultra_low_latency) {
+          GST_WARNING_OBJECT (enc, "ultra-low-latency mode is enabled."
+              "Cannot encode b-frames");
+	} else {
+          priv->is_bframes_changed = TRUE;
+          priv->is_dyn_params_valid = TRUE;
+          enc->b_frames = g_value_get_int (value);
+	}
       } else if (GST_STATE(enc) > GST_STATE_READY) {
         GST_WARNING_OBJECT (enc, "Dynamic configuration of b-frames is supported"
             "only in DEFAULT_GOP mode");
@@ -4062,10 +4250,18 @@ gst_vvas_xvcuenc_set_property (GObject * object, guint prop_id,
       enc->max_bitrate = g_value_get_uint (value);
       break;
     case PROP_MAX_QP:
+      GST_OBJECT_LOCK (enc);
       enc->max_qp = g_value_get_uint (value);
+      priv->is_min_max_qp_changed = TRUE;
+      priv->is_dyn_params_valid = TRUE;
+      GST_OBJECT_UNLOCK (enc);
       break;
     case PROP_MIN_QP:
+      GST_OBJECT_LOCK (enc);
       enc->min_qp = g_value_get_uint (value);
+      priv->is_min_max_qp_changed = TRUE;
+      priv->is_dyn_params_valid = TRUE;
+      GST_OBJECT_UNLOCK (enc);
       break;
     case PROP_NUM_SLICES:
       enc->num_slices = g_value_get_uint (value);
@@ -4125,6 +4321,16 @@ gst_vvas_xvcuenc_set_property (GObject * object, guint prop_id,
     case PROP_ENABLE_PIPELINE:
       enc->enabled_pipeline = g_value_get_boolean (value);
       break;
+    case PROP_TUNE_METRICS:
+      enc->tune_metrics = g_value_get_boolean (value);
+      break;
+    case PROP_ULTRA_LOW_LATENCY:
+      enc->ultra_low_latency = g_value_get_boolean (value);
+      break;
+    case PROP_AVC_LOWLAT:
+      enc->avc_lowlat = g_value_get_boolean (value);
+      break;
+
 #ifdef ENABLE_XRM_SUPPORT
     case PROP_RESERVATION_ID:
       enc->priv->reservation_id = g_value_get_uint64 (value);
@@ -4155,7 +4361,7 @@ gst_vvas_xvcuenc_get_property (GObject * object, guint prop_id,
       g_value_set_enum (value, enc->aspect_ratio);
       break;
     case PROP_B_FRAMES:
-      g_value_set_uint (value, enc->b_frames);
+      g_value_set_int (value, enc->b_frames);
       break;
     case PROP_CONSTRAINED_INTRA_PREDICTION:
       g_value_set_boolean (value, enc->constrained_intra_prediction);
@@ -4244,6 +4450,15 @@ gst_vvas_xvcuenc_get_property (GObject * object, guint prop_id,
     case PROP_ENABLE_PIPELINE:
       g_value_set_boolean (value, enc->enabled_pipeline);
       break;
+    case PROP_TUNE_METRICS:
+      g_value_set_boolean (value, enc->tune_metrics);
+      break;
+    case PROP_ULTRA_LOW_LATENCY:
+      g_value_set_boolean (value, enc->ultra_low_latency);
+      break;
+    case PROP_AVC_LOWLAT:
+      g_value_set_boolean (value, enc->avc_lowlat);
+      break;
 #ifdef ENABLE_XRM_SUPPORT
     case PROP_RESERVATION_ID:
       g_value_set_uint64 (value, enc->priv->reservation_id);
@@ -4301,8 +4516,15 @@ gst_vvas_xvcuenc_finish (GstVideoEncoder * encoder)
 
   if (enc->enabled_pipeline) {
     GstFlowReturn fret = GST_FLOW_OK;
+    if (priv->input_copy_thread) {
+      g_async_queue_push (priv->copy_inqueue, STOP_COMMAND);
+      GST_LOG_OBJECT (enc, "waiting for copy input thread join");
+      g_thread_join (priv->input_copy_thread);
+      priv->input_copy_thread = NULL;
+    }
     GST_INFO_OBJECT (enc, "input copy queue has %d pending buffers",
         g_async_queue_length (priv->copy_outqueue));
+
     while (g_async_queue_length (priv->copy_outqueue) > 0) {
       gboolean bret = FALSE;
       VvasEncCopyObject *copy_outobj = g_async_queue_pop (priv->copy_outqueue);
@@ -4340,6 +4562,10 @@ static void
 gst_vvas_xvcuenc_finalize (GObject * object)
 {
   GstVvasXVCUEnc *enc = GST_VVAS_XVCUENC (object);
+  GstVvasXVCUEncPrivate *priv = enc->priv;
+
+  g_cond_clear (&priv->timeout_cond);
+  g_mutex_clear (&priv->timeout_lock);
 
   if (enc->input_state) {
     gst_video_codec_state_unref (enc->input_state);
@@ -4386,6 +4612,7 @@ gst_vvas_xvcuenc_class_init (GstVvasXVCUEncClass * klass)
       GST_DEBUG_FUNCPTR (gst_vvas_xvcuenc_propose_allocation);
   enc_class->finish = GST_DEBUG_FUNCPTR (gst_vvas_xvcuenc_finish);
   enc_class->handle_frame = GST_DEBUG_FUNCPTR (gst_vvas_xvcuenc_handle_frame);
+  enc_class->sink_query = GST_DEBUG_FUNCPTR (gst_vvas_xvcuenc_sink_query);
 
 #ifndef ENABLE_XRM_SUPPORT
   g_object_class_install_property (gobject_class, PROP_XCLBIN_LOCATION,
@@ -4435,9 +4662,10 @@ gst_vvas_xvcuenc_class_init (GstVvasXVCUEncClass * klass)
 
   /* VCU Gop.NumB */
   g_object_class_install_property (gobject_class, PROP_B_FRAMES,
-      g_param_spec_uint ("b-frames", "Number of B-frames",
-          "Number of B-frames between two consecutive P-frames",
-          0, G_MAXUINT, GST_VVAS_VIDEO_ENC_B_FRAMES_DEFAULT,
+      g_param_spec_int ("b-frames", "Number of B-frames",
+          "Number of B-frames between two consecutive P-frames. "
+          "By default, internally set to 0 for ultra-low-latency mode, 2 otherwise if not configured or configured with -1",
+          -1, G_MAXINT, UNSET_NUM_B_FRAMES,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   /* VCU ConstrainedIntraPred */
@@ -4688,6 +4916,29 @@ gst_vvas_xvcuenc_class_init (GstVvasXVCUEncClass * klass)
           FALSE,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
           GST_PARAM_MUTABLE_READY));
+  /* Tune Metrics */
+  g_object_class_install_property (gobject_class, PROP_TUNE_METRICS,
+      g_param_spec_boolean ("tune-metrics", "Tune Metrics",
+          "Tunes Encoder's video quality for objective metrics ",
+          GST_VVAS_VIDEO_ENC_TUNE_METRICS_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_READY));
+
+  g_object_class_install_property (gobject_class, PROP_ULTRA_LOW_LATENCY,
+      g_param_spec_boolean ("ultra-low-latency",
+          "Serialize encoding",
+          "Serializes encoding when b-frames=0",
+          GST_VVAS_VIDEO_ENC_ULTRA_LOW_LATENCY_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_READY));
+
+  g_object_class_install_property (gobject_class, PROP_AVC_LOWLAT,
+      g_param_spec_boolean ("avc-lowlat",
+          "Enable AVC low latency flag for H264 to run on multiple cores",
+          "Enable AVC low latency flag for H264 to run on multiple cores in ultra-low-latency mode",
+          GST_VVAS_VIDEO_ENC_AVC_LOWLAT_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_READY));
 
   GST_DEBUG_CATEGORY_INIT (gst_vvas_xvcuenc_debug_category, "vvas_xvcuenc", 0,
       "debug category for vcu h264/h265 encoder element");
@@ -4722,7 +4973,7 @@ gst_vvas_xvcuenc_init (GstVvasXVCUEnc * enc)
   enc->slice_size = GST_VVAS_VIDEO_ENC_SLICE_SIZE_DEFAULT;
   enc->prefetch_buffer = GST_VVAS_VIDEO_ENC_PREFETCH_BUFFER_DEFAULT;
   enc->periodicity_idr = GST_VVAS_VIDEO_ENC_PERIODICITY_OF_IDR_FRAMES_DEFAULT;
-  enc->b_frames = GST_VVAS_VIDEO_ENC_B_FRAMES_DEFAULT;
+  enc->b_frames = UNSET_NUM_B_FRAMES;
   enc->gop_length = GST_VVAS_VIDEO_ENC_GOP_LENGTH_DEFAULT;
   enc->entropy_mode = GST_VVAS_VIDEO_ENC_ENTROPY_MODE_DEFAULT;
   enc->slice_qp = GST_VVAS_VIDEO_ENC_SLICE_QP_DEFAULT;
@@ -4733,11 +4984,14 @@ gst_vvas_xvcuenc_init (GstVvasXVCUEnc * enc)
   enc->tier = NULL;
   enc->num_cores = 0;
   enc->rc_mode = GST_VVAS_VIDEO_ENC_RC_MODE_DEFAULT;
+  enc->tune_metrics = GST_VVAS_VIDEO_ENC_TUNE_METRICS_DEFAULT;
   enc->dependent_slice = GST_VVAS_VIDEO_ENC_DEPENDENT_SLICE_DEFAULT;
   enc->ip_delta = GST_VVAS_VIDEO_ENC_IP_DELTA_DEFAULT;
   enc->pb_delta = GST_VVAS_VIDEO_ENC_PB_DELTA_DEFAULT;
   enc->loop_filter_beta_offset = GST_VVAS_VIDEO_ENC_LOOP_FILTER_BETA_DEFAULT;
   enc->loop_filter_tc_offset = GST_VVAS_VIDEO_ENC_LOOP_FILTER_TC_DEFAULT;
+  enc->ultra_low_latency = GST_VVAS_VIDEO_ENC_ULTRA_LOW_LATENCY_DEFAULT;
+  enc->avc_lowlat = GST_VVAS_VIDEO_ENC_AVC_LOWLAT_DEFAULT;
   strcpy(enc->color_description, "COLOUR_DESC_UNSPECIFIED");
   strcpy(enc->transfer_characteristics, "TRANSFER_UNSPECIFIED");
   strcpy(enc->color_matrix, "COLOUR_MAT_UNSPECIFIED");
@@ -4745,6 +4999,8 @@ gst_vvas_xvcuenc_init (GstVvasXVCUEnc * enc)
 #ifdef ENABLE_XRM_SUPPORT
   priv->reservation_id = 0;
 #endif
+  g_mutex_init (&priv->timeout_lock);
+  g_cond_init (&priv->timeout_cond);
   vvas_xvcuenc_reset (enc);
 }
 

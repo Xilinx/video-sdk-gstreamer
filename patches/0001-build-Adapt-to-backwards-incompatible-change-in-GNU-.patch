@@ -1,0 +1,27 @@
+From c16c70cdc3efd2be6380e84ff812fc706cf033f9 Mon Sep 17 00:00:00 2001
+From: Bala Sai Kosuri <balasaik@xilinx.com>
+Date: Wed, 13 Jul 2022 23:09:42 +0530
+Subject: [PATCH] build: Adapt to backwards incompatible change in GNU Make 4.3
+
+Signed-off-by: Bala Sai Kosuri <balasaik@xilinx.com>
+---
+ gst-glib-gen.mak | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/gst-glib-gen.mak b/gst-glib-gen.mak
+index 76b2233..bcb4240 100644
+--- a/gst-glib-gen.mak
++++ b/gst-glib-gen.mak
+@@ -8,7 +8,8 @@
+ #glib_gen_decl_banner=GST_EXPORT
+ #glib_gen_decl_include=\#include <gst/foo/foo-prelude.h>
+ 
+-enum_headers=$(foreach h,$(glib_enum_headers),\n\#include \"$(h)\")
++hash:=\#
++enum_headers=$(foreach h,$(glib_enum_headers),\n$(hash)include \"$(h)\")
+ 
+ # these are all the rules generating the relevant files
+ $(glib_gen_basename)-marshal.h: $(glib_gen_basename)-marshal.list
+-- 
+2.17.1
+

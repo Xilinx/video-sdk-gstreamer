@@ -43,6 +43,8 @@ if [ $# -lt 3 ]; then
      echo "NOTE: Running this script writes encoded output files into /tmp directory and displays the average fps values on terminal for all instances using notation <reoslution>_<deviceid>_<instance_number>"
      echo "e.g. sink_720p60_0_2: last-message = rendered: 4443, dropped: 0, current: 93.77, average: 61.89."
      echo "This shows 72p60 ladder for device 0 and instance 2 is running at 61.89 fps"
+     echo "NOTE: For input raw strem resolutions other than 1080p, change width, height, blocksize and framerate params in the script accordingly"
+     echo "NOTE: blocksize is the size of one frame in bytes"
      echo ""
      exit 1
 fi

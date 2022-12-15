@@ -36,6 +36,8 @@ if [ $# -lt 3 ]; then
      echo -e "\e[01;31m"Note : Script did not run. Check the below help on how to run the script and arguments to be given"\e[0m"
      echo "$0 <Device Index> <raw 4K nv12 file> <Number of encode instances, 1> <10bitinput 0/1> <fakesink 0/1>"
      echo "Ex: $0 0 ~/videos/test4K.nv12 1 0 1"
+     echo "NOTE: For input raw strem resolutions other than 4k, change width, height, blocksize and framerate params in the script accordingly"
+     echo "NOTE: blocksize is the size of one frame in bytes"
      exit 1
 fi
 

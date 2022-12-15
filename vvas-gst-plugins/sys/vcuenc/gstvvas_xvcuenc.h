@@ -76,7 +76,7 @@ struct _GstVvasXVCUEnc
   guint32 slice_size;
   gboolean prefetch_buffer;
   guint32 periodicity_idr;
-  guint32 b_frames;
+  gint b_frames;
   gboolean constrained_intra_prediction;
   guint32 loop_filter_mode;
   guint32 gop_length;
@@ -90,7 +90,10 @@ struct _GstVvasXVCUEnc
   guint32 num_cores;
   gboolean rc_mode;
   gchar *kernel_name;
+  gboolean tune_metrics;
   gboolean dependent_slice;
+  gboolean ultra_low_latency;
+  gboolean avc_lowlat;
   char color_description[VUI_PARAMS_SIZE];
   char transfer_characteristics[VUI_PARAMS_SIZE];
   char color_matrix[VUI_PARAMS_SIZE];

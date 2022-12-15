@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2019, Xilinx Inc - All rights reserved
- * Xilinx Lookahead XMA Plugin
+ * Xilinx Lookahead Plugin
  *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
  * not use this file except in compliance with the License. A copy of the
@@ -46,8 +46,16 @@
 #define XLNX_DEFAULT_SPATIAL_AQ_GAIN   50
 #define XLNX_DEFAULT_TEMPORAL_AQ_MODE  0
 #define XLNX_DEFAULT_NUM_OF_B_FRAMES   2
+#define XLNX_DEFAULT_DYNAMIC_GOP       0
 #define XLNX_DEFAULT_CODEC_TYPE        EXlnxAvc
 #define XLNX_DEFAULT_LATENCY_LOGGING   0
+
+#define XLNX_DYNAMIC_GOP_INTERVAL      4
+#define XLNX_DYNAMIC_GOP_CACHE         (XLNX_DEFAULT_LA_DEPTH / XLNX_DYNAMIC_GOP_INTERVAL) + 1
+
+#define LOW_MOTION                     0
+#define MEDIUM_MOTION                  1
+#define HIGH_MOTION                    2
 
 #define XLNX_MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 

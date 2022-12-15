@@ -61,6 +61,7 @@ struct _GstVvas_XVCUDec
   gboolean splitbuff_mode;
   gboolean avoid_dynamic_alloc;
   gboolean disable_hdr10_sei;
+  gboolean interpolate_timestamps;
 };
 
 struct _GstVvas_XVCUDecClass

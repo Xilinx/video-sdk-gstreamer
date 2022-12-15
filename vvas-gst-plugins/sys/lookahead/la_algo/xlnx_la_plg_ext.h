@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2019, Xilinx Inc - All rights reserved
- * Xilinx Lookahead XMA Plugin
+ * Xilinx Lookahead Plugin
  *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
  * not use this file except in compliance with the License. A copy of the
@@ -29,6 +29,7 @@ typedef enum
     EParamRateControlMode,
     EParamSpatialAQGain,
     EParamNumBFrames,
+    EParamDynamicGop,
     EParamCodecType,
     EParamLatencyLogging
 } xlnx_la_ext_params_t;

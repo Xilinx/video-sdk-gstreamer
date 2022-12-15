@@ -66,6 +66,6 @@ fi
 
 pipe=" -v"
 echo "Script is running for filesink ............"
-pipe="filesrc location=$2 ! rawvideoparse format=nv12 width=1920 height=1080 framerate=60/1 ! vvas_xlookahead  codec-type=0 lookahead-depth=20 spatial-aq=true temporal-aq=true dev-idx=$di b-frames=1 ! vvas_xvcuenc dev-idx=$di b-frames=1 gop-length=120 periodicity-idr=120 qp-mode=3 target-bitrate=$3 max-bitrate=$3 ! h264parse ! fpsdisplaysink video-sink=\"filesink location=/tmp/xil_enc_${bitrate}_subjective.h264 \" text-overlay=false sync=false "$pipe
+pipe="filesrc location=$2 ! rawvideoparse format=nv12 width=1920 height=1080 framerate=60/1 ! vvas_xlookahead  codec-type=0 lookahead-depth=20 spatial-aq=true temporal-aq=true dev-idx=$di b-frames=1 ! vvas_xvcuenc dev-idx=$di b-frames=1 gop-length=120 periodicity-idr=120 qp-mode=relative-load target-bitrate=$3 max-bitrate=$3 ! h264parse ! fpsdisplaysink video-sink=\"filesink location=/tmp/xil_enc_${bitrate}_subjective.h264 \" text-overlay=false sync=false "$pipe
 pipe="gst-launch-1.0 "$pipe
 $pipe
