@@ -113,26 +113,26 @@ else # TARGET == PCIE
   meson build --prefix $PREFIX --libdir $LIB
   cd build
   ninja
-  sudo ninja install
+  ninja install
 
   cd $BASEDIR/vvas-gst-plugins
   meson build --prefix $PREFIX --libdir $LIB -Denable_xrm=$ENABLE_XRM
   cd build
   ninja
-  sudo ninja install
+  ninja install
 
   cd $BASEDIR/vvas-examples/DC
   meson build --prefix $PREFIX --libdir $LIB -Denable_xrm=$ENABLE_XRM
   cd build
   ninja
-  sudo ninja install
+  ninja install
 
   if [ $INSTALL_ACCEL_SW = true ]; then
     cd $BASEDIR/vvas-accel-sw-libs
     meson build --prefix $PREFIX --libdir $LIB
     cd build
     ninja
-    sudo ninja install
+    ninja install
   fi # close $INSTALL_ACCEL_SW = true
 
 fi # close TARGET == PCIE
