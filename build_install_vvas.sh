@@ -48,21 +48,21 @@ if [[ "$TARGET" == "EDGE" ]]; then #TARGET == EDGE
   exit
   fi
 
-  if [ $INSTALL_ACCEL_SW = true ]; then
-    if [ ! -e "$SDKTARGETSYSROOT/usr/lib/libvart-util.so.1.4.0" ]; then
-      echo "Vitis AI 1.4 is not installed in the target sysroot"
-      echo "Please see instructions here: "
-      echo "    https://github.com/Xilinx/Vitis-AI/blob/master/dsa/DPU-TRD/prj/Vitis/README.md"
-      while true; do
-        read -p "Do you wish to install this program? (y/n) " yn
-        case $yn in
-          [Yy]* ) wget -O vitis_ai_2021.1.tar.gz https://www.xilinx.com/bin/public/openDownload?filename=vitis_ai_2021.1-r1.4.0.tar.gz; tar -xzvf vitis_ai_2021.1.tar.gz -C $SDKTARGETSYSROOT; break;;
-          [Nn]* ) exit;;
-          * ) echo "Please answer yes or no.";;
-        esac
-      done
-    fi
-  fi # close [ $INSTALL_ACCEL_SW = true ]
+  # if [ $INSTALL_ACCEL_SW = true ]; then
+  #   if [ ! -e "$SDKTARGETSYSROOT/usr/lib/libvart-util.so.1.4.0" ]; then
+  #     echo "Vitis AI 1.4 is not installed in the target sysroot"
+  #     echo "Please see instructions here: "
+  #     echo "    https://github.com/Xilinx/Vitis-AI/blob/master/dsa/DPU-TRD/prj/Vitis/README.md"
+  #     while true; do
+  #       read -p "Do you wish to install this program? (y/n) " yn
+  #       case $yn in
+  #         [Yy]* ) wget -O vitis_ai_2021.1.tar.gz https://www.xilinx.com/bin/public/openDownload?filename=vitis_ai_2021.1-r1.4.0.tar.gz; tar -xzvf vitis_ai_2021.1.tar.gz -C $SDKTARGETSYSROOT; break;;
+  #         [Nn]* ) exit;;
+  #         * ) echo "Please answer yes or no.";;
+  #       esac
+  #     done
+  #   fi
+  # fi # close [ $INSTALL_ACCEL_SW = true ]
 
   rm -rf install
 
