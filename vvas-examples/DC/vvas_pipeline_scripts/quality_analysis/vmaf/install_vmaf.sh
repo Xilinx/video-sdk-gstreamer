@@ -52,7 +52,7 @@ if [ $retval -ne 0 ]; then
 	return 1
 fi
     ./autogen.sh --prefix=/opt/xilinx/vvas --disable-gtk-doc && \
-    make -j$cpu_count && sudo make install && \
+    make -j$cpu_count && make install && \
 retval=$?
 if [ $retval -ne 0 ]; then
 	echo "Unable to install base gstreamer plugins ($retval)"
@@ -74,7 +74,7 @@ mkdir subprojects && cd subprojects && git clone https://github.com/werti/vmaf.g
 cd vmaf &&  patch -p1 < /tmp/0001-Building-the-vmaf-as-dynamic-library.patch
 cd /tmp/gst-plugins-bad-1.16.2 && \
 meson --prefix=/opt/xilinx/vvas  --libdir=lib -Dyadif=disabled -Dmpegpsmux=disabled build && \
-cd build && ninja && sudo ninja install
+cd build && ninja && ninja install
 
 retval=$?
 if [ $retval -ne 0 ]; then

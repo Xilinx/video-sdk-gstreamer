@@ -3,10 +3,10 @@
 #####################################
 ###### Setup VVAS Environment #######
 #####################################
-sudo rm -rf /opt/xilinx/vvas
-sudo mkdir -p /opt/xilinx/vvas/lib/pkgconfig
-sudo mkdir -p /opt/xilinx/vvas/bin
-sudo cp -rf setup.sh /opt/xilinx/vvas/
+rm -rf /opt/xilinx/vvas
+mkdir -p /opt/xilinx/vvas/lib/pkgconfig
+mkdir -p /opt/xilinx/vvas/bin
+cp -rf setup.sh /opt/xilinx/vvas/
 
 if [[ $PATH == /opt/xilinx/vvas/bin* ]] && \
    [[ $LD_LIBRARY_PATH == /opt/xilinx/vvas/lib* ]] && \
@@ -83,19 +83,19 @@ else
 fi
 
 if [[ $OS_TYPE == "UBUNTU" ]]; then
-	sudo apt-get update
-	sudo apt-get install -y build-essential git autoconf autopoint libtool bison flex yasm \
+	apt-get update
+	apt-get install -y build-essential git autoconf autopoint libtool bison flex yasm \
 		 libssl-dev libjansson-dev python3 python3-pip python3-setuptools python3-wheel \
 		 ninja-build cmake libxext-dev libpango1.0-dev libgdk-pixbuf2.0-dev
 	if [[ $os_version =~ .*18.04.* ]]; then
                 OS_VERSION="18_04"
-                sudo apt-get install -y libpangocairo-1.0-0
+                apt-get install -y libpangocairo-1.0-0
         elif [[ $os_version =~ .*20.04.* ]]; then
                 OS_VERSION="20_04"
-                sudo apt-get install -y libpangocairo-1.0-0 librust-pangocairo-dev
+                apt-get install -y libpangocairo-1.0-0 librust-pangocairo-dev
         elif [[ $os_version =~ .*22.04.* ]]; then
                 OS_VERSION="22_04"
-                sudo apt-get install -y libpangocairo-1.0-0 librust-pangocairo-dev gtk-doc-tools
+                apt-get install -y libpangocairo-1.0-0 librust-pangocairo-dev gtk-doc-tools
         else
                 echo "Unsupported OS version"
                 return 1
@@ -107,36 +107,36 @@ if [[ $OS_TYPE == "UBUNTU" ]]; then
 		return 1
 	fi
 elif [[ $OS_TYPE == "RHEL" ]]; then
-	sudo yum install -y http://repo.okay.com.mx/centos/7/x86_64/release/okay-release-1-1.noarch.rpm
-	sudo yum install -y automake glib glib2-devel openssl-devel openssl-devel xorg-x11-server-devel \
+	yum install -y http://repo.okay.com.mx/centos/7/x86_64/release/okay-release-1-1.noarch.rpm
+	yum install -y automake glib glib2-devel openssl-devel openssl-devel xorg-x11-server-devel \
 		libssl-dev openssl openssl-devel yasm-devel  python3 python3-pip python3-setuptools python3-wheel jansson-devel ninja-build \
 		pango pango-devel cairo-devel gdk-pixbuf2-devel
 elif [[ $OS_TYPE == "AMAZON" ]]; then
-	sudo yum install -y http://repo.okay.com.mx/centos/7/x86_64/release/okay-release-1-1.noarch.rpm
-	sudo yum-config-manager --save --setopt=okay.skip_if_unavailable=true
+	yum install -y http://repo.okay.com.mx/centos/7/x86_64/release/okay-release-1-1.noarch.rpm
+	yum-config-manager --save --setopt=okay.skip_if_unavailable=true
 	
 	cd /tmp/ && wget http://ftp.gnu.org/gnu/automake/automake-1.14.tar.gz --no-check-certificate && \
 	tar xvzf automake-1.14.tar.gz && cd automake-1.14 && \
 	./configure
-	make && sudo make install
+	make && make install
 	cd $BASEDIR
 	rm -rf /tmp/automake*
 	
-	sudo yum install -y automake glib glib2-devel openssl-devel openssl-devel xorg-x11-server-devel \
+	yum install -y automake glib glib2-devel openssl-devel openssl-devel xorg-x11-server-devel \
 		libssl-dev openssl openssl-devel yasm-devel  python3 python3-pip python3-setuptools python3-wheel jansson-devel ninja-build \
 		pango pango-devel cairo-devel gdk-pixbuf2-devel gettext-devel flex bison
 elif [[ $OS_TYPE == "CENTOS" ]]; then
-	sudo yum install -y http://repo.okay.com.mx/centos/7/x86_64/release/okay-release-1-1.noarch.rpm
-	sudo yum-config-manager --save --setopt=okay.skip_if_unavailable=true
+	yum install -y http://repo.okay.com.mx/centos/7/x86_64/release/okay-release-1-1.noarch.rpm
+	yum-config-manager --save --setopt=okay.skip_if_unavailable=true
 	
 	cd /tmp/ && wget http://ftp.gnu.org/gnu/automake/automake-1.14.tar.gz --no-check-certificate && \
 	tar xvzf automake-1.14.tar.gz && cd automake-1.14 && \
 	./configure
-	make && sudo make install
+	make && make install
 	cd $BASEDIR
 	rm -rf /tmp/automake*
 	
-	sudo yum install -y automake glib glib2-devel openssl-devel openssl-devel xorg-x11-server-devel \
+	yum install -y automake glib glib2-devel openssl-devel openssl-devel xorg-x11-server-devel \
 		libssl-dev openssl openssl-devel yasm-devel  python3 python3-pip python3-setuptools python3-wheel jansson-devel ninja-build \
 		pango pango-devel cairo-devel gdk-pixbuf2-devel gettext-devel flex bison
 else
@@ -158,7 +158,7 @@ cd /tmp/ && wget https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.16.
     tar -xvf gstreamer-1.16.2.tar.xz && cd gstreamer-1.16.2 && \
     cd common && patch -p1 < /tmp/0001-build-Adapt-to-backwards-incompatible-change-in-GNU-.patch && cd .. && \
     ./autogen.sh --prefix=/opt/xilinx/vvas --disable-gtk-doc
-    make -j$cpu_count && sudo make install
+    make -j$cpu_count && make install
 retval=$?
 if [ $retval -ne 0 ]; then
 	echo "Unable to install gstreamer core package ($retval)"
@@ -185,7 +185,7 @@ if [ $retval -ne 0 ]; then
 	return 1
 fi
     ./autogen.sh --prefix=/opt/xilinx/vvas --disable-gtk-doc && \
-    make -j$cpu_count && sudo make install && \
+    make -j$cpu_count && make install && \
 retval=$?
 if [ $retval -ne 0 ]; then
 	echo "Unable to install base gstreamer plugins ($retval)"
@@ -203,7 +203,7 @@ cd /tmp/ && wget https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plug
     cd common && patch -p1 < /tmp/0001-build-Adapt-to-backwards-incompatible-change-in-GNU-.patch && cd .. && \
     patch -p1 < /tmp/0001-Use-helper-function-to-map-colorimetry-parameters.patch && \
     ./autogen.sh --prefix=/opt/xilinx/vvas --disable-gtk-doc && \
-    make -j$cpu_count && sudo make install
+    make -j$cpu_count && make install
 retval=$?
 if [ $retval -ne 0 ]; then
 	echo "Unable to install good gstreamer plugins ($retval)"
@@ -221,7 +221,7 @@ cd /tmp/ && wget https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugi
     cd common && patch -p1 < /tmp/0001-build-Adapt-to-backwards-incompatible-change-in-GNU-.patch && cd .. && \
     patch -p1 < /tmp/0001-Update-Colorimetry-and-SEI-parsing-for-HDR10.patch && \
     patch -p1 < /tmp/0001-Derive-src-fps-from-vui_time_scale-vui_num_units_in_.patch && \
-    ./autogen.sh --prefix=/opt/xilinx/vvas --disable-gtk-doc --disable-openexr --disable-yadif --disable-mpegpsmux && make -j$cpu_count && sudo make install
+    ./autogen.sh --prefix=/opt/xilinx/vvas --disable-gtk-doc --disable-openexr --disable-yadif --disable-mpegpsmux && make -j$cpu_count && make install
 retval=$?
 if [ $retval -ne 0 ]; then
 	echo "Unable to install bad gstreamer plugins ($retval)"
@@ -234,7 +234,7 @@ rm -rf /tmp/gst-plugins-bad-1.16.2*
 # GStreamer libav package installation
 cd /tmp/ && wget https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-1.16.2.tar.xz --no-check-certificate && \
     tar -xvf gst-libav-1.16.2.tar.xz && cd gst-libav-1.16.2 && \
-    ./autogen.sh --prefix=/opt/xilinx/vvas --disable-gtk-doc  && make -j$cpu_count && sudo make install
+    ./autogen.sh --prefix=/opt/xilinx/vvas --disable-gtk-doc  && make -j$cpu_count && make install
 retval=$?
 if [ $retval -ne 0 ]; then
 	echo "Unable to install gstreamer libav ($retval)"
@@ -249,27 +249,27 @@ if [[ $OS_TYPE == "UBUNTU" ]]; then
 	#pip3 install meson
 	#export PATH=~/.local/bin:$PATH
 	#elif [[ $OS_TYPE == "RHEL" ]]; then
-	sudo pip3 install meson
+	pip3 install meson
 elif [[ $OS_TYPE == "RHEL" ]]; then
-	sudo pip3 install meson
+	pip3 install meson
     if [ ! -f /usr/bin/ninja ]; then
-        sudo ln -s /usr/local/bin/ninja /usr/bin/ninja
+        ln -s /usr/local/bin/ninja /usr/bin/ninja
     fi
 elif [[ $OS_TYPE == "CENTOS" ]]; then
 	#pip3 install meson --user
 	#pip3 install ninja --user
 	#export PATH=~/.local/bin:$PATH
-	sudo pip3 install meson
-	sudo pip3 install ninja
+	pip3 install meson
+	pip3 install ninja
 	export PATH=/usr/local/bin:$PATH
 elif [[ $OS_TYPE == "AMAZON" ]]; then
 	#pip3 install meson --user
 	#pip3 install ninja --user
 	#export PATH=~/.local/bin:$PATH
-	sudo pip3 install meson
-	sudo pip3 install ninja
+	pip3 install meson
+	pip3 install ninja
     if [ ! -f /usr/bin/ninja ]; then
-        sudo ln -s /usr/local/bin/ninja /usr/bin/ninja
+        ln -s /usr/local/bin/ninja /usr/bin/ninja
     fi
 	export PATH=/usr/local/bin:$PATH
 fi
@@ -281,4 +281,4 @@ rm -rf ~/.cache/gstreamer-1.0/
 
 echo "#######################################################################"
 echo "########         GStreamer setup completed successful          ########"
-echo"#######################################################################"
+echo "#######################################################################"
